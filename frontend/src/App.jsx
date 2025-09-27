@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { Line } from 'react-chartjs-2';
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js';
-import ReactMarkdown from 'react-markdown';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
@@ -14,22 +13,19 @@ function App() {
     const [heatmap, setHeatmap] = useState(null);
     const [chartData, setChartData] = useState(null);
 
-    const debounce = (func, delay) => {
+    // simple debounce helper for map events
+    const debounce = (func, wait = 300) => {
         let timeout;
-        return function(...args) {
-            const context = this;
+        return (...args) => {
             clearTimeout(timeout);
-            timeout = setTimeout(() => func.apply(context, args), delay);
+            timeout = setTimeout(() => func.apply(this, args), wait);
         };
     };
 
-    const handleLocationChange = (e) => {
-        setLocation(e.target.value);
-    };
+    const handleLocationChange = (e) => setLocation(e.target.value);
 
     const handleSearch = async () => {
         if (location.trim() === '') return;
-
         try {
             const response = await fetch('/api/geocode', {
                 method: 'POST',
@@ -43,7 +39,6 @@ function App() {
             }
 
             const coordinates = await response.json();
-
             if (map && coordinates) {
                 const { lat, lng } = coordinates;
                 const newCenter = new window.google.maps.LatLng(lat, lng);
@@ -54,7 +49,6 @@ function App() {
             console.error("Failed to geocode location:", error);
             alert(`Could not find the location: ${error.message}`);
         }
-        
         setLocation('');
     };
 
@@ -62,7 +56,7 @@ function App() {
         if (messageText.trim() === '') return;
 
         const userMessage = { sender: 'user', text: messageText };
-        setMessages(prevMessages => [...prevMessages, userMessage]);
+        setMessages(prev => [...prev, userMessage]);
         setInput('');
 
         try {
@@ -72,14 +66,11 @@ function App() {
                 body: JSON.stringify({ prompt: messageText }),
             });
 
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
+            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
             const data = await response.json();
-
             const botMessage = { sender: 'bot', ...data.explanation };
-            setMessages(prevMessages => [...prevMessages, botMessage]);
+            setMessages(prev => [...prev, botMessage]);
 
             if (map && data.coordinates) {
                 const { lat, lng } = data.coordinates;
@@ -87,7 +78,7 @@ function App() {
                 map.panTo(newCenter);
                 map.setZoom(12);
             }
-            
+
             const forecastResponse = await fetch('/api/forecast', { method: 'POST' });
             const forecastData = await forecastResponse.json();
             setChartData(forecastData);
@@ -95,9 +86,12 @@ function App() {
         } catch (error) {
             console.error("Failed to send message:", error);
             const errorMessage = { sender: 'bot', text: "Sorry, I'm having trouble connecting. Please try again later." };
-            setMessages(prevMessages => [...prevMessages, errorMessage]);
+            setMessages(prev => [...prev, errorMessage]);
         }
     };
+
+    // Normalize AQI to 0-1 for consistent heatmap coloring
+    const normalizeAQI = (aqi, min = 0, max = 200) => Math.max(0, Math.min(1, (aqi - min) / (max - min)));
 
     useEffect(() => {
         const googleMapsScriptUrl = `https://maps.googleapis.com/maps/api/js?key=${import.meta.env.VITE_GOOGLE_MAPS_API_KEY}&libraries=visualization`;
@@ -106,50 +100,85 @@ function App() {
         script.async = true;
         script.defer = true;
 
-        script.onload = () => {
-            const atlanta = { lat: 33.7490, lng: -84.3880 };
+        script.onload = async () => {
             const newMap = new window.google.maps.Map(mapRef.current, {
-                center: atlanta,
-                zoom: 8,
+                center: { lat: 20, lng: 0 },
+                zoom: 2,
                 mapTypeControl: false,
                 streetViewControl: false,
             });
             setMap(newMap);
 
             const newHeatmap = new window.google.maps.visualization.HeatmapLayer({
-                data: [], map: newMap, radius: 40, opacity: 0.7,
+                data: [],
+                map: newMap,
+                // radius will be adjusted dynamically based on zoom
+                radius: 20,
+                opacity: 0.7,
+                // allow heatmap to dissipate with zoom so points don't merge at low zoom
+                dissipating: true,
                 gradient: [
-                    'rgba(0, 255, 0, 0)', 'rgba(0, 255, 0, 1)', 'rgba(255, 255, 0, 1)',
-                    'rgba(255, 140, 0, 1)', 'rgba(255, 0, 0, 1)', 'rgba(128, 0, 128, 1)'
+                    "rgba(0, 255, 0, 0)",     // Good
+                    "rgba(0, 255, 0, 0.6)",   // Good
+                    "rgba(255, 255, 0, 0.8)", // Moderate
+                    "rgba(255, 165, 0, 0.9)", // Unhealthy for sensitive groups
+                    "rgba(255, 0, 0, 1)",     // Unhealthy
+                    "rgba(128, 0, 128, 1)",   // Very Unhealthy
+                    "rgba(128, 0, 0, 1)"      // Hazardous
                 ]
             });
             setHeatmap(newHeatmap);
-
-            newMap.addListener('idle', debounce(async () => {
-                const bounds = newMap.getBounds();
-                if(!bounds) return;
-                const ne = bounds.getNorthEast();
-                const sw = bounds.getSouthWest();
-
+            // Fetch heatmap points only for the current viewport bounds
+            const fetchHeatmapForBounds = async (bounds) => {
                 try {
+                    if (!bounds) return;
+                    const ne = bounds.getNorthEast();
+                    const sw = bounds.getSouthWest();
+                    const body = JSON.stringify({
+                        sw: { lat: sw.lat(), lng: sw.lng() },
+                        ne: { lat: ne.lat(), lng: ne.lng() }
+                    });
+
                     const response = await fetch('/api/heatmap-data', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            sw: { lat: sw.lat(), lng: sw.lng() },
-                            ne: { lat: ne.lat(), lng: ne.lng() }
-                        }),
+                        body
                     });
                     const data = await response.json();
                     const heatmapData = data.map(point => ({
                         location: new window.google.maps.LatLng(point.lat, point.lng),
-                        weight: point.aqi
+                        weight: normalizeAQI(point.aqi)
                     }));
                     if (newHeatmap) newHeatmap.setData(heatmapData);
                 } catch (error) {
                     console.error("Error fetching heatmap data:", error);
                 }
-            }, 1000));
+            };
+
+            // Initial fetch for the current view
+            fetchHeatmapForBounds(newMap.getBounds());
+
+            // Debounced fetch on idle (pan/zoom end)
+            newMap.addListener('idle', debounce(() => {
+                const bounds = newMap.getBounds();
+                fetchHeatmapForBounds(bounds);
+            }, 400));
+
+            // Adjust radius dynamically on zoom changes so points don't merge when zoomed out
+            newMap.addListener('zoom_changed', () => {
+                const zoom = newMap.getZoom();
+                // radius shrinks as you zoom out; clamp to reasonable range
+                const radius = Math.max(2, Math.min(60, Math.round(40 - zoom * 2)));
+                if (newHeatmap && newHeatmap.set) {
+                    try {
+                        newHeatmap.set('radius', radius);
+                        // also update options to be safe
+                        newHeatmap.setOptions({ radius });
+                    } catch (e) {
+                        // ignore if not supported in older API
+                    }
+                }
+            });
         };
 
         script.onerror = () => console.error("Google Maps script failed to load.");
