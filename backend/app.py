@@ -645,16 +645,21 @@ def classify_query_type(user_prompt):
     ]) and any(keyword in prompt_lower for keyword in ['air', 'aqi', 'pollution', 'quality', 'ozone', 'pm', 'particulate']):
         return 'general_air_quality'
     
-    # Location-specific queries (only if clearly asking about a specific place with context)
-    location_indicators = ['in ', 'at ', 'near ', 'around ']
-    place_names = [' city', ' country', ' state', ' province', ' town', ' area', ' region']
+    # Location-specific queries - simpler logic that allows direct location queries
+    # First check for obvious location patterns with prepositions
+    if any(phrase in prompt_lower for phrase in ['air quality in ', 'aqi in ', 'pollution in ', 'air quality at ', 'aqi at ', 'pollution at ', 'air quality near ', 'aqi near ', 'pollution near ']):
+        return 'location_query'
     
-    # Must have both location indicator AND place name AND air quality context
-    has_location_indicator = any(phrase in prompt_lower for phrase in location_indicators)
-    has_place_name = any(phrase in prompt_lower for phrase in place_names)
-    has_air_quality_context = any(phrase in prompt_lower for phrase in ['air quality', 'aqi', 'pollution'])
+    # Check for common city names or location patterns (but not if it's clearly a general question)
+    common_places = ['beijing', 'london', 'tokyo', 'paris', 'new york', 'york', 'los angeles', 'angeles', 'san francisco', 'francisco', 'chicago', 'boston', 'seattle', 'miami', 'dallas', 'houston', 'atlanta', 'denver', 'phoenix', 'detroit', 'toronto', 'vancouver', 'montreal', 'sydney', 'melbourne', 'mumbai', 'delhi', 'shanghai', 'hong kong', 'singapore', 'bangkok', 'jakarta', 'manila', 'seoul', 'osaka', 'cairo', 'lagos', 'nairobi', 'cape town', 'johannesburg', 'berlin', 'madrid', 'rome', 'amsterdam', 'brussels', 'vienna', 'prague', 'warsaw', 'stockholm', 'oslo', 'helsinki', 'dublin', 'moscow', 'istanbul', 'athens', 'lisbon', 'zurich', 'geneva', 'barcelona', 'milan', 'venice', 'florence']
     
-    if has_location_indicator and (has_place_name or any(word in prompt_lower.split() for word in ['beijing', 'london', 'tokyo', 'paris', 'york', 'angeles', 'francisco', 'chicago', 'boston', 'seattle', 'miami', 'dallas'])) and has_air_quality_context:
+    # If it's just a place name or simple location query, treat as location
+    words = prompt_lower.split()
+    if len(words) <= 3 and any(place in prompt_lower for place in common_places):
+        return 'location_query'
+    
+    # More specific location patterns
+    if any(phrase in prompt_lower for phrase in ['in ', 'at ', 'near ', 'around ']) and not any(phrase in prompt_lower for phrase in ['what is', 'how much', 'what level', 'what range', 'is it', 'should i']):
         return 'location_query'
     
     # If it contains air quality keywords but doesn't fit other categories
