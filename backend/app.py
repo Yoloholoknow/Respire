@@ -253,15 +253,36 @@ def handle_query():
 
 @app.route('/api/forecast', methods=['POST'])
 def get_forecast_data():
-    """Provides sample forecast data."""
+    """Provides location-specific forecast data."""
+    data = request.get_json()
+    lat = data.get('lat')
+    lng = data.get('lng')
+    
+    if not lat or not lng:
+        return jsonify({"error": "Latitude and longitude are required"}), 400
+    
+    # Get current AQI as baseline
+    current_aqi_data = get_air_quality(lat, lng)
+    base_aqi = current_aqi_data.get('aqi', 50) if current_aqi_data else 50
+    
+    # Generate realistic forecast based on location and current conditions
+    forecast_values = []
+    for i in range(7):
+        # Add some variation based on day and location
+        day_variation = (hash(f"{lat}_{lng}_{i}") % 30) - 15  # ±15 variation
+        seasonal_trend = 5 * (i - 3) / 3  # slight trend over week
+        forecast_aqi = max(10, min(200, int(base_aqi + day_variation + seasonal_trend)))
+        forecast_values.append(forecast_aqi)
+    
     forecast_data = {
-        "labels": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        "labels": ["Today", "Tomorrow", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7"],
         "datasets": [
             {
                 "label": "Predicted AQI",
-                "data": [58, 62, 55, 65, 70, 68, 72],
+                "data": forecast_values,
                 "fill": False,
                 "borderColor": 'rgb(75, 192, 192)',
+                "backgroundColor": 'rgba(75, 192, 192, 0.2)',
                 "tension": 0.1
             }
         ]

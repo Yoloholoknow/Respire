@@ -51,6 +51,19 @@ function App() {
                 const newCenter = new window.google.maps.LatLng(lat, lng);
                 map.panTo(newCenter);
                 map.setZoom(12);
+                
+                // Fetch forecast data for the searched location
+                try {
+                    const forecastResponse = await fetch('/api/forecast', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ lat, lng }),
+                    });
+                    const forecastData = await forecastResponse.json();
+                    setChartData(forecastData);
+                } catch (forecastError) {
+                    console.error("Failed to fetch forecast data:", forecastError);
+                }
             }
         } catch (error) {
             console.error("Failed to geocode location:", error);
@@ -86,7 +99,15 @@ function App() {
                 map.setZoom(12);
             }
 
-            const forecastResponse = await fetch('/api/forecast', { method: 'POST' });
+            // Fetch location-specific forecast data
+            const forecastResponse = await fetch('/api/forecast', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    lat: data.coordinates.lat, 
+                    lng: data.coordinates.lng 
+                }),
+            });
             const forecastData = await forecastResponse.json();
             setChartData(forecastData);
 
@@ -231,7 +252,10 @@ function App() {
             </div>
             <div className="w-1/3 h-full flex flex-col bg-gray-800 border-l border-gray-700">
                 <div className="p-4 border-b border-gray-700 flex justify-between items-center">
-                    <h1 className="text-2xl font-bold text-teal-400">AI Air Quality Assistant</h1>
+                    <div className="flex items-center space-x-3">
+                        <img src="/respire-logo.svg" alt="Respire Logo" className="w-8 h-8" />
+                        <h1 className="text-2xl font-bold text-teal-400">Respire</h1>
+                    </div>
                     <div className="flex space-x-2 items-center">
                         {!isAuthenticated ? (
                             <LoginButton />
