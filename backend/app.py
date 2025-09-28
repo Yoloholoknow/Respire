@@ -2,13 +2,19 @@ import os
 from flask import Flask, request, jsonify
 import google.generativeai as genai
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 import json
 import traceback
-from functools import wraps
+from functools import wraps, lru_cache
 from jose import jwt, JWTError
 from urllib.request import urlopen
 from flask_cors import CORS
+import time
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Load environment variables from a .env file
 load_dotenv()
@@ -45,6 +51,26 @@ CORS(app)  # Enable CORS for all domains
 
 # In-memory user profiles storage (in production, use a database)
 user_profiles = {}
+
+# Performance optimizations
+# Configure requests session with connection pooling and retries
+session = requests.Session()
+retry_strategy = Retry(
+    total=2,
+    backoff_factor=0.3,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=20)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+
+# Simple in-memory cache for WAQI responses (5 minute TTL)
+waqi_cache = {}
+waqi_cache_lock = threading.Lock()
+CACHE_TTL = 300  # 5 minutes
+
+# Thread pool for concurrent processing
+executor = ThreadPoolExecutor(max_workers=10)
 
 # --- Auth0 Helper Functions ---
 
@@ -174,12 +200,26 @@ def get_air_quality(lat, lng):
     Returns a unified structure with keys: provider, raw, aqi, dominant_pollutant, pollutants (list).
     Falls back to an estimation if WAQI token is not configured or WAQI returns no data.
     """
-    # Try WAQI first
+    # Try WAQI first with caching
     if WAQI_API_TOKEN:
+        # Create cache key (round coordinates to reduce cache misses)
+        cache_key = f"waqi_{round(lat, 3)}_{round(lng, 3)}"
+        
+        # Check cache first
+        with waqi_cache_lock:
+            if cache_key in waqi_cache:
+                cached_data, timestamp = waqi_cache[cache_key]
+                if time.time() - timestamp < CACHE_TTL:
+                    print(f"Using cached WAQI data for {lat}, {lng}")
+                    return cached_data
+                else:
+                    # Remove expired entry
+                    del waqi_cache[cache_key]
+        
         try:
             url = f"https://api.waqi.info/feed/geo:{lat};{lng}/?token={WAQI_API_TOKEN}"
             print(f"Querying WAQI for {lat}, {lng}")
-            resp = requests.get(url, timeout=8)
+            resp = session.get(url, timeout=3)  # Reduced timeout from 8 to 3 seconds
             resp.raise_for_status()
             data = resp.json()
             if data.get("status") == "ok" and isinstance(data.get("data"), dict):
@@ -207,6 +247,17 @@ def get_air_quality(lat, lng):
                     "city": d.get("city", {}).get("name") if d.get("city") else None,
                     "time": d.get("time")
                 }
+                
+                # Cache the successful response
+                with waqi_cache_lock:
+                    waqi_cache[cache_key] = (unified, time.time())
+                    # Clean old cache entries (keep cache size manageable)
+                    if len(waqi_cache) > 1000:
+                        # Remove oldest 100 entries
+                        oldest_keys = sorted(waqi_cache.keys(), key=lambda k: waqi_cache[k][1])[:100]
+                        for old_key in oldest_keys:
+                            del waqi_cache[old_key]
+                
                 return unified
             else:
                 print(f"WAQI returned no data for {lat},{lng}: {data.get('status')}")
@@ -1572,12 +1623,59 @@ def get_forecast_data():
     }
     return jsonify(forecast_data)
 
+@lru_cache(maxsize=128)
+def generate_heatmap_points_cached(lat_min, lng_min, lat_max, lng_max, target_cells):
+    """Generate heatmap points with caching for identical requests."""
+    points = []
+    lat_step = max(0.5, min(6.0, (lat_max - lat_min) / target_cells if (lat_max - lat_min) > 0 else 1.0))
+    lng_step = max(0.5, min(6.0, (lng_max - lng_min) / target_cells if (lng_max - lng_min) > 0 else 1.0))
+    
+    # Generate coordinate pairs more efficiently
+    lat_range = int((lat_max - lat_min) / lat_step) + 1
+    lng_range = int((lng_max - lng_min) / lng_step) + 1
+    
+    # Limit the number of points to prevent timeout
+    max_coords = min(lat_range * lng_range, 400)
+    coord_count = 0
+    
+    for i in range(lat_range):
+        if coord_count >= max_coords:
+            break
+        lat = lat_min + i * lat_step
+        if lat > lat_max:
+            break
+            
+        for j in range(lng_range):
+            if coord_count >= max_coords:
+                break
+            lng = lng_min + j * lng_step
+            if lng > lng_max:
+                break
+                
+            actual_lat = max(-85, min(85, lat + (hash(f"{lat}_{lng}") % 3 - 1)))
+            actual_lng = lng + (hash(f"{lng}_{lat}") % 4 - 2)
+            if actual_lng > 180:
+                actual_lng -= 360
+            if actual_lng < -180:
+                actual_lng += 360
+            
+            estimated_aqi = estimate_pollution_by_location(actual_lat, actual_lng)
+            points.append({
+                "lat": actual_lat,
+                "lng": actual_lng,
+                "aqi": estimated_aqi,
+                "weight": estimated_aqi,
+                "estimated": True
+            })
+            coord_count += 1
+    
+    return points
+
 @app.route('/api/heatmap-data', methods=['POST'])
 def get_heatmap_data():
     """Creates a dense global pollution heatmap using estimated and real data."""
-    if not MAPS_API_KEY:
-        print("ERROR: GOOGLE_MAPS_API_KEY not configured for heatmap")
-        return jsonify({"error": "Google Maps API key not configured."}), 500
+    start_time = time.time()
+    
     # Accept viewport bounds in the POST body to return points only within view
     try:
         body = request.get_json(silent=True) or {}
@@ -1586,8 +1684,8 @@ def get_heatmap_data():
 
     sw = body.get('sw')
     ne = body.get('ne')
-    # Allow client to request a maximum number of points (sensible default)
-    max_points = int(body.get('max_points', 1500))
+    # Reduced default max points for faster response
+    max_points = min(int(body.get('max_points', 800)), 1200)  # Cap at 1200 for performance
 
     heatmap_points = []
 
@@ -1603,128 +1701,91 @@ def get_heatmap_data():
             if lat_min > lat_max:
                 lat_min, lat_max = lat_max, lat_min
 
-            # handle antimeridian crossing for longitude
-            crosses_antimeridian = False
-            if lng_min <= lng_max:
-                lng_span = lng_max - lng_min
-            else:
-                crosses_antimeridian = True
-                lng_span = (180 - lng_min) + (lng_max + 180)
+            # Simplified approach - no antimeridian handling for performance
+            if lng_min > lng_max:
+                lng_min, lng_max = lng_max, lng_min
 
-            # Target ~30x30 grid within viewport; clamp steps to 0.25-8 degrees
-            target_cells = 30.0
-            lat_step = max(0.25, min(8.0, (lat_max - lat_min) / target_cells if (lat_max - lat_min) > 0 else 1.0))
-            lng_step = max(0.25, min(8.0, lng_span / target_cells if lng_span > 0 else 1.0))
-
-            # Iterate latitude
-            lat = lat_min
-            while lat <= lat_max:
-                # iterate longitude, taking antimeridian into account
-                if not crosses_antimeridian:
-                    lng = lng_min
-                    while lng <= lng_max:
-                        actual_lat = max(-85, min(85, lat + (hash(f"{lat}_{lng}") % 3 - 1)))
-                        actual_lng = lng + (hash(f"{lng}_{lat}") % 4 - 2)
-                        if actual_lng > 180:
-                            actual_lng -= 360
-                        if actual_lng < -180:
-                            actual_lng += 360
-
-                        estimated_aqi = estimate_pollution_by_location(actual_lat, actual_lng)
-                        heatmap_points.append({
-                            "lat": actual_lat,
-                            "lng": actual_lng,
-                            "aqi": estimated_aqi,
-                            "weight": estimated_aqi,
-                            "estimated": True
-                        })
-                        lng += lng_step
-                else:
-                    # two ranges: lng_min..180 and -180..lng_max
-                    lng = lng_min
-                    while lng <= 180:
-                        actual_lat = max(-85, min(85, lat + (hash(f"{lat}_{lng}") % 3 - 1)))
-                        actual_lng = lng + (hash(f"{lng}_{lat}") % 4 - 2)
-                        estimated_aqi = estimate_pollution_by_location(actual_lat, actual_lng)
-                        heatmap_points.append({
-                            "lat": actual_lat,
-                            "lng": actual_lng,
-                            "aqi": estimated_aqi,
-                            "weight": estimated_aqi,
-                            "estimated": True
-                        })
-                        lng += lng_step
-                    lng = -180
-                    while lng <= lng_max:
-                        actual_lat = max(-85, min(85, lat + (hash(f"{lat}_{lng}") % 3 - 1)))
-                        actual_lng = lng + (hash(f"{lng}_{lat}") % 4 - 2)
-                        estimated_aqi = estimate_pollution_by_location(actual_lat, actual_lng)
-                        heatmap_points.append({
-                            "lat": actual_lat,
-                            "lng": actual_lng,
-                            "aqi": estimated_aqi,
-                            "weight": estimated_aqi,
-                            "estimated": True
-                        })
-                        lng += lng_step
-
-                lat += lat_step
+            # Reduced target cells for faster generation
+            target_cells = 20.0  # Reduced from 30 to 20
+            
+            # Use cached generation for better performance
+            heatmap_points = generate_heatmap_points_cached(
+                round(lat_min, 2), round(lng_min, 2), 
+                round(lat_max, 2), round(lng_max, 2), 
+                target_cells
+            )
 
         except Exception as e:
             print(f"Error generating bounded heatmap: {e}")
+            # Fallback to simple grid
+            heatmap_points = []
+            for lat in range(int(lat_min), int(lat_max) + 1, 2):
+                for lng in range(int(lng_min), int(lng_max) + 1, 2):
+                    estimated_aqi = estimate_pollution_by_location(lat, lng)
+                    heatmap_points.append({
+                        "lat": lat,
+                        "lng": lng,
+                        "aqi": estimated_aqi,
+                        "weight": estimated_aqi,
+                        "estimated": True
+                    })
 
-        # Add some real data points inside bounds to improve accuracy
-        real_data_points = get_limited_real_data()
-        # Filter real data by bounds
-        def in_bounds(p):
-            plat, plng = p.get('lat'), p.get('lng')
-            if lat_min <= plat <= lat_max:
-                if not crosses_antimeridian:
-                    return lng_min <= plng <= lng_max
-                else:
-                    return plng >= lng_min or plng <= lng_max
-            return False
-
-        real_in_bounds = [p for p in real_data_points if in_bounds(p)]
-        heatmap_points.extend(real_in_bounds)
+        # Add limited real data points for accuracy (but keep it fast)
+        try:
+            real_data_points = get_limited_real_data()[:50]  # Limit to 50 real points
+            # Simple bounds check
+            real_in_bounds = [p for p in real_data_points 
+                             if lat_min <= p.get('lat', 0) <= lat_max and 
+                                lng_min <= p.get('lng', 0) <= lng_max]
+            heatmap_points.extend(real_in_bounds)
+        except Exception as e:
+            print(f"Error adding real data points: {e}")
 
     else:
-        # No bounds provided: generate a coarse global grid but cap size
-        lat_step = 6
-        lng_step = 8
-        for lat in range(-80, 81, lat_step):
+        # No bounds provided: generate a very coarse global grid for speed
+        heatmap_points = []
+        lat_step = 10  # Increased step size for faster generation
+        lng_step = 12
+        
+        # Limit global points to essential major cities and regions
+        for lat in range(-60, 71, lat_step):  # Reduced range, exclude polar regions
             for lng in range(-180, 181, lng_step):
-                actual_lat = lat + (hash(f"{lat}_{lng}") % 3 - 1)
-                actual_lng = lng + (hash(f"{lng}_{lat}") % 4 - 2)
-                actual_lat = max(-85, min(85, actual_lat))
-                actual_lng = max(-180, min(180, actual_lng))
-                estimated_aqi = estimate_pollution_by_location(actual_lat, actual_lng)
+                estimated_aqi = estimate_pollution_by_location(lat, lng)
                 heatmap_points.append({
-                    "lat": actual_lat,
-                    "lng": actual_lng,
+                    "lat": lat,
+                    "lng": lng,
                     "aqi": estimated_aqi,
                     "weight": estimated_aqi,
                     "estimated": True
                 })
+                # Limit total points for performance
+                if len(heatmap_points) >= 200:
+                    break
+            if len(heatmap_points) >= 200:
+                break
 
-        heatmap_points.extend(get_limited_real_data())
+        # Add limited real data
+        try:
+            real_data = get_limited_real_data()[:100]  # Limit real data points
+            heatmap_points.extend(real_data)
+        except Exception as e:
+            print(f"Error adding real data: {e}")
 
-    # Downsample deterministically if too many points
+    # Fast downsampling if needed
     total = len(heatmap_points)
     if total > max_points:
-        sampled = []
-        step = float(total) / float(max_points)
-        i = 0.0
-        while len(sampled) < max_points and int(i) < total:
-            sampled.append(heatmap_points[int(i)])
-            i += step
-        heatmap_points = sampled
+        # Simple every-nth sampling for speed
+        step = max(1, total // max_points)
+        heatmap_points = heatmap_points[::step]
 
-    print(f"Returning {len(heatmap_points)} heatmap points (requested max {max_points})")
+    generation_time = time.time() - start_time
+    print(f"Generated {len(heatmap_points)} heatmap points in {generation_time:.2f}s (requested max {max_points})")
     return jsonify(heatmap_points)
 
+@lru_cache(maxsize=2000)
 def estimate_pollution_by_location(lat, lng):
-    """Estimate pollution levels based on geographic location and known patterns."""
+    """Estimate pollution levels based on geographic location and known patterns.
+    Cached for performance since this is called frequently for heatmap generation."""
     
     # Base pollution level (clean air)
     base_pollution = 20
@@ -1828,8 +1889,10 @@ def is_ocean_area(lat, lng):
         
     return False
 
+@lru_cache(maxsize=1)
 def get_limited_real_data():
-    """Get a small amount of real API data for key locations."""
+    """Get a small amount of real API data for key locations.
+    Cached to avoid repeated API calls for heatmap generation."""
     real_points = []
     
     # Key cities where we want real data (limit to 10 to avoid quota issues)
