@@ -348,13 +348,165 @@ def geocode_location():
 
     return jsonify(coordinates)
 
+def classify_query_type(user_prompt):
+    """Classify the type of user query to determine how to handle it."""
+    prompt_lower = user_prompt.lower()
+    
+    # General AQI questions
+    if any(phrase in prompt_lower for phrase in ['what is aqi', 'what does aqi mean', 'explain aqi', 'air quality index']):
+        return 'aqi_explanation'
+    
+    # Health condition questions
+    if any(phrase in prompt_lower for phrase in ['asthma', 'copd', 'heart condition', 'respiratory', 'pregnant', 'elderly', 'child']):
+        return 'health_advice'
+    
+    # Trend questions
+    if any(phrase in prompt_lower for phrase in ['trend', 'getting better', 'getting worse', 'improving', 'forecast']):
+        return 'trend_analysis'
+    
+    # General air quality questions
+    if any(phrase in prompt_lower for phrase in ['how to protect', 'what should i do', 'safety tips', 'recommendations']):
+        return 'general_advice'
+    
+    # Location-specific queries (default)
+    return 'location_query'
+
+def handle_general_questions(query_type, user_prompt):
+    """Handle general questions that don't require location-specific data."""
+    
+    if query_type == 'aqi_explanation':
+        return {
+            "type": "educational",
+            "title": "What is the Air Quality Index (AQI)?",
+            "content": {
+                "overview": {
+                    "definition": "The Air Quality Index (AQI) is a number used to communicate how polluted the air currently is or how polluted it is forecast to become.",
+                    "scale": "AQI values range from 0 to 500, where higher values indicate greater health concerns.",
+                    "purpose": "It helps you understand what local air quality means to your health."
+                },
+                "categories": [
+                    {"range": "0-50", "level": "Good", "color": "Green", "description": "Air quality is satisfactory, and air pollution poses little or no risk."},
+                    {"range": "51-100", "level": "Moderate", "color": "Yellow", "description": "Air quality is acceptable for most people, though sensitive individuals may experience minor issues."},
+                    {"range": "101-150", "level": "Unhealthy for Sensitive Groups", "color": "Orange", "description": "Members of sensitive groups may experience health effects."},
+                    {"range": "151-200", "level": "Unhealthy", "color": "Red", "description": "Everyone may begin to experience health effects."},
+                    {"range": "201-300", "level": "Very Unhealthy", "color": "Purple", "description": "Health alert: everyone may experience more serious health effects."},
+                    {"range": "301-500", "level": "Hazardous", "color": "Maroon", "description": "Emergency conditions: everyone is more likely to be affected."}
+                ],
+                "pollutants": {
+                    "description": "AQI is calculated based on five major pollutants:",
+                    "list": ["PM2.5 (fine particles)", "PM10 (coarse particles)", "Ozone (O₃)", "Nitrogen Dioxide (NO₂)", "Sulfur Dioxide (SO₂)", "Carbon Monoxide (CO)"]
+                }
+            }
+        }
+    
+    elif query_type == 'health_advice':
+        health_conditions = {
+            'asthma': {
+                'condition': 'Asthma',
+                'general_advice': 'People with asthma should be especially careful during poor air quality days.',
+                'recommendations': [
+                    'Keep rescue inhalers accessible at all times',
+                    'Monitor AQI daily and limit outdoor activities when levels are unhealthy',
+                    'Consider wearing N95 masks during high pollution days',
+                    'Keep windows closed and use air purifiers indoors',
+                    'Take medications as prescribed by your doctor'
+                ],
+                'warning_signs': ['Increased coughing', 'Shortness of breath', 'Chest tightness', 'Wheezing']
+            },
+            'heart condition': {
+                'condition': 'Heart Disease',
+                'general_advice': 'Air pollution can increase the risk of heart attacks and other cardiovascular problems.',
+                'recommendations': [
+                    'Avoid outdoor exercise during high pollution days',
+                    'Take medications as prescribed',
+                    'Monitor for symptoms like chest pain or unusual fatigue',
+                    'Consider indoor activities when AQI > 100',
+                    'Consult your doctor about air quality concerns'
+                ],
+                'warning_signs': ['Chest pain', 'Unusual fatigue', 'Shortness of breath', 'Irregular heartbeat']
+            },
+            'copd': {
+                'condition': 'COPD (Chronic Obstructive Pulmonary Disease)',
+                'general_advice': 'COPD patients are highly sensitive to air pollution and should take extra precautions.',
+                'recommendations': [
+                    'Stay indoors when AQI exceeds 100',
+                    'Use prescribed medications regularly',
+                    'Consider oxygen therapy if recommended by doctor',
+                    'Avoid areas with heavy traffic or industrial pollution',
+                    'Use air purifiers and keep indoor air clean'
+                ],
+                'warning_signs': ['Increased breathlessness', 'More frequent coughing', 'Changes in mucus color', 'Fatigue']
+            }
+        }
+        
+        # Determine which condition is mentioned
+        condition_key = 'general'
+        for key in health_conditions.keys():
+            if key in user_prompt.lower():
+                condition_key = key
+                break
+        
+        if condition_key in health_conditions:
+            condition_info = health_conditions[condition_key]
+            return {
+                "type": "health_advice",
+                "title": f"Air Quality Advice for {condition_info['condition']}",
+                "content": condition_info
+            }
+        else:
+            return {
+                "type": "health_advice",
+                "title": "General Health Advice for Air Quality",
+                "content": {
+                    'condition': 'General Population',
+                    'general_advice': 'Everyone should be aware of air quality levels and take appropriate precautions.',
+                    'recommendations': [
+                        'Check daily AQI forecasts',
+                        'Limit outdoor activities when AQI > 150',
+                        'Exercise indoors during poor air quality days',
+                        'Keep windows closed during high pollution periods',
+                        'Consider air purifiers for your home'
+                    ],
+                    'sensitive_groups': ['Children', 'Elderly (65+)', 'Pregnant women', 'People with heart/lung conditions']
+                }
+            }
+    
+    elif query_type == 'general_advice':
+        return {
+            "type": "general_advice",
+            "title": "Air Quality Protection Tips",
+            "content": {
+                "indoor_tips": [
+                    "Keep windows and doors closed during high pollution days",
+                    "Use air purifiers with HEPA filters",
+                    "Avoid using candles, fireplaces, or gas stoves",
+                    "Keep indoor plants that help purify air",
+                    "Vacuum regularly with HEPA filter"
+                ],
+                "outdoor_tips": [
+                    "Check AQI before going outside",
+                    "Wear N95 or P100 masks when AQI > 150",
+                    "Avoid exercising outdoors during poor air quality",
+                    "Stay away from busy roads during rush hour",
+                    "Plan outdoor activities during early morning or late evening"
+                ],
+                "when_to_be_concerned": [
+                    "AQI consistently above 100 for your area",
+                    "Visible smog or haze",
+                    "Burning smell in the air",
+                    "Respiratory symptoms increasing",
+                    "Local air quality alerts issued"
+                ]
+            }
+        }
+    
+    return None
+
 @app.route('/api/query', methods=['POST'])
 def handle_query():
     """Main endpoint to handle user's natural language queries."""
     if not llm:
         return jsonify({"error": "LLM not configured. Check your GOOGLE_API_KEY."}), 500
-    if not MAPS_API_KEY:
-        return jsonify({"error": "Google Maps API key not configured."}), 500
 
     data = request.get_json()
     user_prompt = data.get('prompt')
@@ -363,12 +515,29 @@ def handle_query():
         return jsonify({"error": "Prompt is required"}), 400
 
     try:
+        # First, classify the type of query
+        query_type = classify_query_type(user_prompt)
+        
+        # Handle general questions that don't need location data
+        if query_type in ['aqi_explanation', 'health_advice', 'general_advice']:
+            general_response = handle_general_questions(query_type, user_prompt)
+            if general_response:
+                return jsonify({
+                    "explanation": general_response,
+                    "coordinates": None,
+                    "raw_aqi_data": None
+                })
+        
+        # For location-specific queries, proceed with location extraction
+        if not MAPS_API_KEY:
+            return jsonify({"error": "Google Maps API key not configured."}), 500
+            
         location_extraction_prompt = f"Extract only the city and country from the following text, in the format 'City, Country'. If a specific city is not mentioned, identify the most likely major city based on the context. Text: '{user_prompt}'"
         location_response = llm.generate_content(location_extraction_prompt)
         location_name = location_response.text.strip()
 
         if not location_name or "could not" in location_name.lower():
-            return jsonify({"error": "Could not identify a location from your query."}), 400
+            return jsonify({"error": "Could not identify a location from your query. Please specify a city or location."}), 400
 
         coordinates = get_lat_lng(location_name)
         if not coordinates:
@@ -379,6 +548,9 @@ def handle_query():
             return jsonify({"error": "Could not retrieve air quality data for the location."}), 500
 
         explanation_json = format_air_quality_data(aqi_data)
+        
+        # Add location name to the response
+        explanation_json["location_name"] = location_name
 
         return jsonify({
             "coordinates": coordinates,

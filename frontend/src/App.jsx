@@ -15,7 +15,7 @@ function App() {
     const mapRef = useRef(null);
     const [map, setMap] = useState(null);
     const [heatmap, setHeatmap] = useState(null);
-    const [chartData, setChartData] = useState(null);
+
     const { user, isAuthenticated, loginWithRedirect, logout } = useAuth0();
     const [showProfile, setShowProfile] = useState(false);
     const profileRef = useRef(null);
@@ -52,17 +52,35 @@ function App() {
                 map.panTo(newCenter);
                 map.setZoom(12);
                 
-                // Fetch forecast data for the searched location
+                // Fetch air quality data for the searched location and create a message
                 try {
-                    const forecastResponse = await fetch('/api/forecast', {
+                    const aqiResponse = await fetch('/api/query', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ lat, lng }),
+                        body: JSON.stringify({ prompt: `Air quality in ${location}` }),
                     });
-                    const forecastData = await forecastResponse.json();
-                    setChartData(forecastData);
-                } catch (forecastError) {
-                    console.error("Failed to fetch forecast data:", forecastError);
+                    
+                    if (aqiResponse.ok) {
+                        const aqiData = await aqiResponse.json();
+                        let searchMessage = { sender: 'bot', ...aqiData.explanation };
+                        
+                        // Fetch forecast data and add to message
+                        try {
+                            const forecastResponse = await fetch('/api/forecast', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ lat, lng }),
+                            });
+                            const forecastData = await forecastResponse.json();
+                            searchMessage.chartData = forecastData;
+                        } catch (forecastError) {
+                            console.error("Failed to fetch forecast data:", forecastError);
+                        }
+                        
+                        setMessages(prev => [...prev, searchMessage]);
+                    }
+                } catch (aqiError) {
+                    console.error("Failed to fetch AQI data:", aqiError);
                 }
             }
         } catch (error) {
@@ -89,27 +107,35 @@ function App() {
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
             const data = await response.json();
-            const botMessage = { sender: 'bot', ...data.explanation };
-            setMessages(prev => [...prev, botMessage]);
+            let botMessage = { sender: 'bot', ...data.explanation };
 
+            // Only handle map and forecast for location-specific queries
             if (map && data.coordinates) {
                 const { lat, lng } = data.coordinates;
                 const newCenter = new window.google.maps.LatLng(lat, lng);
                 map.panTo(newCenter);
                 map.setZoom(12);
+                
+                // Fetch location-specific forecast data only when we have coordinates
+                try {
+                    const forecastResponse = await fetch('/api/forecast', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ 
+                            lat: data.coordinates.lat, 
+                            lng: data.coordinates.lng 
+                        }),
+                    });
+                    const forecastData = await forecastResponse.json();
+                    // Add chart data directly to this message
+                    botMessage.chartData = forecastData;
+                } catch (forecastError) {
+                    console.error("Failed to fetch forecast data:", forecastError);
+                    // Don't show error to user for forecast failures
+                }
             }
 
-            // Fetch location-specific forecast data
-            const forecastResponse = await fetch('/api/forecast', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    lat: data.coordinates.lat, 
-                    lng: data.coordinates.lng 
-                }),
-            });
-            const forecastData = await forecastResponse.json();
-            setChartData(forecastData);
+            setMessages(prev => [...prev, botMessage]);
 
         } catch (error) {
             console.error("Failed to send message:", error);
@@ -268,6 +294,29 @@ function App() {
                     </div>
                 </div>
                 <div className="flex-1 p-4 overflow-y-auto">
+                    {messages.length === 0 && (
+                        <div className="mb-6">
+                            <h3 className="text-lg font-semibold text-white mb-3">Try asking me:</h3>
+                            <div className="grid grid-cols-1 gap-2">
+                                {[
+                                    "What is AQI?",
+                                    "Air quality in New York",
+                                    "What should I do if I have asthma?",
+                                    "How to protect myself from air pollution?",
+                                    "Air quality in London",
+                                    "Health advice for heart conditions"
+                                ].map((question, i) => (
+                                    <button
+                                        key={i}
+                                        onClick={() => handleSendMessage(question)}
+                                        className="text-left p-3 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm text-gray-300 hover:text-white transition-colors"
+                                    >
+                                        💬 {question}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                     {messages.map((msg, index) => (
                         <div key={index} className={`mb-4 flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
                             <div className={`p-4 rounded-lg ${msg.sender === 'user' ? 'bg-blue-600 max-w-md' : 'bg-gray-700 w-full'}`}>
@@ -377,17 +426,164 @@ function App() {
                                                 </div>
                                             )}
                                         </div>
+                                    ) : msg.type === 'educational' ? (
+                                        <div className="space-y-4">
+                                            <div className="flex items-center border-b border-gray-600 pb-3">
+                                                <h3 className="text-lg font-bold text-white">{msg.title}</h3>
+                                            </div>
+                                            
+                                            {/* AQI Definition */}
+                                            <div className="bg-gray-600 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-teal-400 mb-2">Overview</h4>
+                                                <p className="text-sm text-gray-300 mb-2">{msg.content.overview.definition}</p>
+                                                <p className="text-sm text-gray-300 mb-2">{msg.content.overview.scale}</p>
+                                                <p className="text-sm text-gray-300">{msg.content.overview.purpose}</p>
+                                            </div>
+
+                                            {/* AQI Categories */}
+                                            <div className="bg-gray-600 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-teal-400 mb-3">AQI Categories</h4>
+                                                <div className="space-y-2">
+                                                    {msg.content.categories.map((category, i) => (
+                                                        <div key={i} className="flex items-center justify-between p-2 bg-gray-700 rounded">
+                                                            <div className="flex items-center space-x-3">
+                                                                <span className={`w-4 h-4 rounded ${
+                                                                    category.color === 'Green' ? 'bg-green-500' :
+                                                                    category.color === 'Yellow' ? 'bg-yellow-500' :
+                                                                    category.color === 'Orange' ? 'bg-orange-500' :
+                                                                    category.color === 'Red' ? 'bg-red-500' :
+                                                                    category.color === 'Purple' ? 'bg-purple-500' :
+                                                                    'bg-red-900'
+                                                                }`}></span>
+                                                                <div>
+                                                                    <span className="font-semibold text-white">{category.range}</span>
+                                                                    <span className="ml-2 text-gray-300">{category.level}</span>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            {/* Pollutants Info */}
+                                            <div className="bg-gray-600 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-teal-400 mb-2">Key Pollutants</h4>
+                                                <p className="text-sm text-gray-300 mb-2">{msg.content.pollutants.description}</p>
+                                                <ul className="text-sm text-gray-300 space-y-1">
+                                                    {msg.content.pollutants.list.map((pollutant, i) => (
+                                                        <li key={i} className="flex items-center">
+                                                            <span className="w-2 h-2 bg-teal-400 rounded-full mr-2"></span>
+                                                            {pollutant}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+                                        </div>
+                                    ) : msg.type === 'health_advice' ? (
+                                        <div className="space-y-4">
+                                            <div className="flex items-center border-b border-gray-600 pb-3">
+                                                <h3 className="text-lg font-bold text-white">{msg.title}</h3>
+                                            </div>
+                                            
+                                            <div className="bg-gray-600 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-teal-400 mb-2">General Advice</h4>
+                                                <p className="text-sm text-gray-300">{msg.content.general_advice}</p>
+                                            </div>
+
+                                            <div className="bg-gray-600 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-teal-400 mb-3">Recommendations</h4>
+                                                <ul className="text-sm text-gray-300 space-y-2">
+                                                    {msg.content.recommendations.map((rec, i) => (
+                                                        <li key={i} className="flex items-start">
+                                                            <span className="w-2 h-2 bg-blue-400 rounded-full mr-2 mt-2"></span>
+                                                            {rec}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+
+                                            {msg.content.warning_signs && (
+                                                <div className="bg-red-900 bg-opacity-20 border border-red-500 p-3 rounded-lg">
+                                                    <h4 className="font-semibold text-red-400 mb-2">Warning Signs to Watch For</h4>
+                                                    <ul className="text-sm text-gray-300 space-y-1">
+                                                        {msg.content.warning_signs.map((sign, i) => (
+                                                            <li key={i} className="flex items-center">
+                                                                <span className="w-2 h-2 bg-red-400 rounded-full mr-2"></span>
+                                                                {sign}
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                </div>
+                                            )}
+
+                                            {msg.content.sensitive_groups && (
+                                                <div className="bg-gray-600 p-3 rounded-lg">
+                                                    <h4 className="font-semibold text-teal-400 mb-2">Sensitive Groups</h4>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {msg.content.sensitive_groups.map((group, i) => (
+                                                            <span key={i} className="px-3 py-1 bg-orange-500 text-white text-xs rounded-full">
+                                                                {group}
+                                                            </span>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    ) : msg.type === 'general_advice' ? (
+                                        <div className="space-y-4">
+                                            <div className="flex items-center border-b border-gray-600 pb-3">
+                                                <h3 className="text-lg font-bold text-white">{msg.title}</h3>
+                                            </div>
+                                            
+                                            <div className="bg-gray-600 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-teal-400 mb-3">Indoor Protection Tips</h4>
+                                                <ul className="text-sm text-gray-300 space-y-2">
+                                                    {msg.content.indoor_tips.map((tip, i) => (
+                                                        <li key={i} className="flex items-start">
+                                                            <span className="w-2 h-2 bg-green-400 rounded-full mr-2 mt-2"></span>
+                                                            {tip}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+
+                                            <div className="bg-gray-600 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-teal-400 mb-3">Outdoor Protection Tips</h4>
+                                                <ul className="text-sm text-gray-300 space-y-2">
+                                                    {msg.content.outdoor_tips.map((tip, i) => (
+                                                        <li key={i} className="flex items-start">
+                                                            <span className="w-2 h-2 bg-blue-400 rounded-full mr-2 mt-2"></span>
+                                                            {tip}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+
+                                            <div className="bg-yellow-900 bg-opacity-20 border border-yellow-500 p-3 rounded-lg">
+                                                <h4 className="font-semibold text-yellow-400 mb-2">When to Be Concerned</h4>
+                                                <ul className="text-sm text-gray-300 space-y-1">
+                                                    {msg.content.when_to_be_concerned.map((concern, i) => (
+                                                        <li key={i} className="flex items-start">
+                                                            <span className="w-2 h-2 bg-yellow-400 rounded-full mr-2 mt-2"></span>
+                                                            {concern}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+                                        </div>
                                     ) : <p className="text-white">{msg.text}</p>)
                                 }
+
+                                {/* Individual chart for location-specific responses */}
+                                {msg.chartData && msg.overview && (
+                                    <div className="bg-gray-700 p-4 rounded-lg mt-4">
+                                        <h3 className="text-xl font-bold mb-2 text-white">7-Day AQI Forecast</h3>
+                                        <Line data={msg.chartData} />
+                                    </div>
+                                )}
                             </div>
                         </div>
                     ))}
-                    {chartData && (
-                        <div className="bg-gray-700 p-4 rounded-lg mt-4">
-                            <h3 className="text-xl font-bold mb-2">7-Day AQI Forecast</h3>
-                            <Line data={chartData} />
-                        </div>
-                    )}
                 </div>
                 <div className="p-4 border-t border-gray-700">
                     <div className="flex">
