@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
 import { Line } from 'react-chartjs-2';
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js';
+import { useAuth0 } from '@auth0/auth0-react';
+import LoginButton from './components/loginButton';
+import LogoutButton from './components/logoutButton';
+import Profile from './components/profile';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
@@ -12,6 +16,9 @@ function App() {
     const [map, setMap] = useState(null);
     const [heatmap, setHeatmap] = useState(null);
     const [chartData, setChartData] = useState(null);
+    const { user, isAuthenticated, loginWithRedirect, logout } = useAuth0();
+    const [showProfile, setShowProfile] = useState(false);
+    const profileRef = useRef(null);
 
     // simple debounce helper for map events
     const debounce = (func, wait = 300) => {
@@ -187,8 +194,20 @@ function App() {
         return () => { document.head.removeChild(script); };
     }, []);
 
+    // Close profile card when clicking outside
+    useEffect(() => {
+        const handleOutsideClick = (e) => {
+            if (!showProfile) return;
+            if (profileRef.current && !profileRef.current.contains(e.target)) {
+                setShowProfile(false);
+            }
+        };
+        document.addEventListener('mousedown', handleOutsideClick);
+        return () => document.removeEventListener('mousedown', handleOutsideClick);
+    }, [showProfile]);
+
     return (
-        <div className="flex h-screen font-sans bg-gray-900 text-white">
+        <div className="flex h-screen w-screen font-sans bg-gray-900 text-white overflow-hidden">
             <div className="relative w-2/3 h-full">
                 <div ref={mapRef} className="w-full h-full"></div>
                 <div className="absolute top-4 left-4 bg-gray-800 p-2 rounded-lg shadow-lg">
@@ -211,8 +230,18 @@ function App() {
                 </div>
             </div>
             <div className="w-1/3 h-full flex flex-col bg-gray-800 border-l border-gray-700">
-                <div className="p-4 border-b border-gray-700">
+                <div className="p-4 border-b border-gray-700 flex justify-between items-center">
                     <h1 className="text-2xl font-bold text-teal-400">AI Air Quality Assistant</h1>
+                    <div className="flex space-x-2 items-center">
+                        {!isAuthenticated ? (
+                            <LoginButton />
+                        ) : (
+                            <>
+                                <LogoutButton />
+                                <Profile />
+                            </>
+                        )}
+                    </div>
                 </div>
                 <div className="flex-1 p-4 overflow-y-auto">
                     {messages.map((msg, index) => (
