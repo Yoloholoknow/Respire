@@ -5,6 +5,10 @@ import requests
 from dotenv import load_dotenv
 import json
 import traceback
+from functools import wraps
+from jose import jwt, JWTError
+from urllib.request import urlopen
+from flask_cors import CORS
 
 # Load environment variables from a .env file
 load_dotenv()
@@ -25,8 +29,118 @@ except (ValueError, Exception) as e:
 MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 WAQI_API_TOKEN = os.environ.get("WAQI_API_TOKEN")
 
+# Auth0 Configuration
+AUTH0_DOMAIN = os.environ.get("AUTH0_DOMAIN")
+AUTH0_API_AUDIENCE = os.environ.get("AUTH0_API_AUDIENCE")
+AUTH0_ALGORITHMS = ["RS256"]
+
+# Auth0 Configuration
+AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN')
+AUTH0_API_AUDIENCE = os.environ.get('AUTH0_API_AUDIENCE')
+ALGORITHMS = ["RS256"]
+
 # --- Flask App Initialization ---
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all domains
+
+# In-memory user profiles storage (in production, use a database)
+user_profiles = {}
+
+# --- Auth0 Helper Functions ---
+
+def get_token_auth_header():
+    """Obtains the Access Token from the Authorization Header"""
+    auth = request.headers.get("Authorization", None)
+    print(f"Authorization header: {auth}")  # Debug
+    if not auth:
+        print("No Authorization header found")  # Debug
+        return None
+    
+    parts = auth.split()
+    if parts[0].lower() != "bearer":
+        print(f"Invalid auth type: {parts[0]}")  # Debug
+        return None
+    elif len(parts) == 1:
+        print("No token found in Authorization header")  # Debug
+        return None
+    elif len(parts) > 2:
+        print("Malformed Authorization header")  # Debug
+        return None
+    
+    token = parts[1]
+    print(f"Token extracted: {token[:20]}...")  # Debug (first 20 chars)
+    return token
+
+def verify_decode_jwt(token):
+    """Verifies and decodes the JWT token"""
+    print(f"AUTH0_DOMAIN: {AUTH0_DOMAIN}")  # Debug
+    print(f"AUTH0_API_AUDIENCE: {AUTH0_API_AUDIENCE}")  # Debug
+    
+    if not AUTH0_DOMAIN or not AUTH0_API_AUDIENCE:
+        print("Missing AUTH0_DOMAIN or AUTH0_API_AUDIENCE")  # Debug
+        return None
+        
+    try:
+        # Use requests library for better SSL handling
+        response = requests.get(f"https://{AUTH0_DOMAIN}/.well-known/jwks.json")
+        response.raise_for_status()
+        jwks = response.json()
+        print("Successfully fetched JWKS")  # Debug
+        
+        unverified_header = jwt.get_unverified_header(token)
+        print(f"Token header: {unverified_header}")  # Debug
+        rsa_key = {}
+        
+        for key in jwks["keys"]:
+            if key["kid"] == unverified_header["kid"]:
+                rsa_key = {
+                    "kty": key["kty"],
+                    "kid": key["kid"],
+                    "use": key["use"],
+                    "n": key["n"],
+                    "e": key["e"]
+                }
+                break
+        
+        if rsa_key:
+            print("RSA key found, attempting to decode...")  # Debug
+            payload = jwt.decode(
+                token,
+                rsa_key,
+                algorithms=AUTH0_ALGORITHMS,
+                audience=AUTH0_API_AUDIENCE,
+                issuer=f"https://{AUTH0_DOMAIN}/"
+            )
+            print(f"Token decoded successfully: {payload.get('sub')}")  # Debug
+            return payload
+        else:
+            print("No matching RSA key found")  # Debug
+    except JWTError as e:
+        print(f"JWT Error: {e}")  # Debug
+        return None
+    except Exception as e:
+        print(f"General error in JWT verification: {e}")  # Debug
+        return None
+    
+    return None
+
+def get_user_from_token():
+    """Extract user info from token if present"""
+    token = get_token_auth_header()
+    if not token:
+        return None
+    
+    payload = verify_decode_jwt(token)
+    print(f"JWT payload: {payload}")  # Debug
+    if payload:
+        return {
+            'user_id': payload.get('sub'),
+            'email': payload.get('email'),
+            'name': payload.get('name'),
+            'picture': payload.get('picture'),
+            'user_metadata': payload.get('https://respire-app.com/user_metadata', {})  # Custom claim
+        }
+    return None
 
 # --- Helper Functions ---
 
@@ -332,6 +446,82 @@ def format_air_quality_data(aqi_data):
 
 # --- API Endpoints ---
 
+@app.route('/api/test-auth', methods=['GET'])
+def test_auth():
+    """Test authentication and show token info"""
+    user = get_user_from_token()
+    return jsonify({
+        'authenticated': user is not None,
+        'user': user,
+        'headers': dict(request.headers)
+    })
+
+@app.route('/api/user/profile', methods=['GET'])
+def get_user_profile():
+    """Get user profile data."""
+    user = get_user_from_token()
+    if not user:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    user_id = user['user_id']
+    profile = user_profiles.get(user_id, {
+        'age': None,
+        'medical_conditions': [],
+        'allergies': [],
+        'medications': [],
+        'activity_level': 'moderate',
+        'location': None
+    })
+    
+    return jsonify({
+        'user_info': user,
+        'profile': profile
+    })
+
+@app.route('/api/user/profile', methods=['POST'])
+def update_user_profile():
+    """Update user profile data."""
+    print(f"POST /api/user/profile - Headers: {dict(request.headers)}")  # Debug
+    user = get_user_from_token()
+    print(f"User from token: {user}")  # Debug
+    if not user:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    data = request.get_json()
+    user_id = user['user_id']
+    
+    # Validate and sanitize input
+    profile = {
+        'age': data.get('age'),
+        'medical_conditions': data.get('medical_conditions', []),
+        'allergies': data.get('allergies', []),
+        'medications': data.get('medications', []),
+        'activity_level': data.get('activity_level', 'moderate'),
+        'location': data.get('location')
+    }
+    
+    # Validate age
+    if profile['age'] is not None:
+        try:
+            age = int(profile['age'])
+            if age < 0 or age > 120:
+                return jsonify({"error": "Invalid age"}), 400
+            profile['age'] = age
+        except (ValueError, TypeError):
+            return jsonify({"error": "Age must be a number"}), 400
+    
+    # Validate activity level
+    valid_activity_levels = ['low', 'moderate', 'high', 'very_high']
+    if profile['activity_level'] not in valid_activity_levels:
+        profile['activity_level'] = 'moderate'
+    
+    user_profiles[user_id] = profile
+    
+    return jsonify({
+        'message': 'Profile updated successfully',
+        'profile': profile
+    })
+
 @app.route('/api/geocode', methods=['POST'])
 def geocode_location():
     """Geocodes a location name to latitude and longitude."""
@@ -370,6 +560,223 @@ def classify_query_type(user_prompt):
     
     # Location-specific queries (default)
     return 'location_query'
+
+def generate_personalized_recommendations(aqi_data, user_profile):
+    """Generate personalized health recommendations based on user profile."""
+    if not user_profile:
+        return None
+    
+    age = user_profile.get('age')
+    medical_conditions = user_profile.get('medical_conditions', [])
+    allergies = user_profile.get('allergies', [])
+    activity_level = user_profile.get('activity_level', 'moderate')
+    
+    aqi = aqi_data.get('aqi', 0)
+    
+    recommendations = {
+        'title': 'Personalized Recommendations',
+        'age_specific': [],
+        'condition_specific': [],
+        'activity_specific': [],
+        'urgent_warnings': []
+    }
+    
+    # Age-specific recommendations
+    if age:
+        if age < 18:
+            recommendations['age_specific'].extend([
+                'Children are more sensitive to air pollution due to developing lungs',
+                'Limit outdoor sports and activities when AQI > 100',
+                'Ensure you stay hydrated and take frequent breaks indoors'
+            ])
+            if aqi > 150:
+                recommendations['urgent_warnings'].append('Avoid all outdoor activities when AQI exceeds 150')
+        elif age >= 65:
+            recommendations['age_specific'].extend([
+                'Older adults are at higher risk for air pollution-related health effects',
+                'Consider postponing outdoor activities when AQI > 100',
+                'Keep rescue medications easily accessible'
+            ])
+            if aqi > 100:
+                recommendations['urgent_warnings'].append('Stay indoors and keep windows closed when AQI > 100')
+        elif 18 <= age < 65:
+            if aqi > 150:
+                recommendations['age_specific'].append('Reduce strenuous outdoor activities and consider indoor alternatives')
+    
+    # Medical condition-specific recommendations
+    condition_recommendations = {
+        'asthma': {
+            'general': [
+                'Keep your rescue inhaler with you at all times',
+                'Consider pre-medicating before going outside if recommended by your doctor',
+                'Monitor your symptoms closely and go indoors if they worsen'
+            ],
+            'aqi_thresholds': {
+                50: ['Use air purifiers indoors and keep windows closed'],
+                100: ['Limit outdoor activities and take frequent breaks indoors'],
+                150: ['Avoid all outdoor activities and stay indoors with air conditioning']
+            }
+        },
+        'copd': {
+            'general': [
+                'Use your prescribed medications as directed',
+                'Consider oxygen therapy if recommended by your doctor',
+                'Avoid areas with heavy traffic or industrial pollution'
+            ],
+            'aqi_thresholds': {
+                50: ['Stay indoors during peak pollution hours'],
+                100: ['Avoid all outdoor activities and keep windows closed'],
+                150: ['Emergency action: Stay indoors, use air purifiers, contact doctor if symptoms worsen']
+            }
+        },
+        'heart_disease': {
+            'general': [
+                'Monitor for chest pain, unusual fatigue, or shortness of breath',
+                'Take medications as prescribed',
+                'Avoid strenuous activities during high pollution days'
+            ],
+            'aqi_thresholds': {
+                100: ['Consider indoor exercise alternatives'],
+                150: ['Avoid all outdoor physical activity'],
+                200: ['Stay indoors and contact your doctor if you experience cardiac symptoms']
+            }
+        },
+        'diabetes': {
+            'general': [
+                'Air pollution can affect blood sugar control',
+                'Monitor blood glucose more frequently during high pollution days',
+                'Stay hydrated and take medications as prescribed'
+            ],
+            'aqi_thresholds': {
+                100: ['Limit outdoor activities and monitor blood sugar closely'],
+                150: ['Stay indoors and check blood glucose more frequently']
+            }
+        }
+    }
+    
+    for condition in medical_conditions:
+        condition_lower = condition.lower()
+        if condition_lower in condition_recommendations:
+            rec = condition_recommendations[condition_lower]
+            recommendations['condition_specific'].extend(rec['general'])
+            
+            # Add AQI-specific recommendations
+            for threshold in sorted(rec['aqi_thresholds'].keys()):
+                if aqi >= threshold:
+                    recommendations['condition_specific'].extend(rec['aqi_thresholds'][threshold])
+    
+    # Activity level recommendations
+    activity_recommendations = {
+        'low': {
+            100: ['Gentle indoor activities are recommended'],
+            150: ['Stay indoors and avoid any physical exertion']
+        },
+        'moderate': {
+            100: ['Consider indoor exercise alternatives like yoga or light stretching'],
+            150: ['Replace outdoor workouts with indoor activities']
+        },
+        'high': {
+            50: ['Consider timing outdoor workouts for early morning or late evening'],
+            100: ['Move intense workouts indoors or reschedule for cleaner air days'],
+            150: ['Avoid all outdoor exercise and choose indoor fitness activities']
+        },
+        'very_high': {
+            50: ['Monitor air quality closely and adjust workout intensity'],
+            100: ['Significantly reduce outdoor training intensity or move indoors'],
+            150: ['Cancel outdoor training sessions and use indoor facilities only']
+        }
+    }
+    
+    if activity_level in activity_recommendations:
+        for threshold in sorted(activity_recommendations[activity_level].keys()):
+            if aqi >= threshold:
+                recommendations['activity_specific'].extend(activity_recommendations[activity_level][threshold])
+    
+    # Allergy-specific recommendations
+    if allergies:
+        recommendations['condition_specific'].extend([
+            'Air pollution can worsen allergy symptoms',
+            'Consider taking antihistamines as recommended by your doctor',
+            'Use HEPA air purifiers to reduce indoor allergens'
+        ])
+    
+    # Remove duplicates and empty lists
+    for key in list(recommendations.keys()):
+        if isinstance(recommendations[key], list):
+            recommendations[key] = list(set(recommendations[key]))
+            if not recommendations[key]:
+                del recommendations[key]
+    
+    return recommendations if any(recommendations.values()) else None
+
+def generate_personalized_health_advice(user_prompt, user_profile):
+    """Generate personalized health advice for general health questions."""
+    if not user_profile or not llm:
+        return None
+    
+    age = user_profile.get('age', 'unspecified')
+    medical_conditions = user_profile.get('medical_conditions', [])
+    allergies = user_profile.get('allergies', [])
+    activity_level = user_profile.get('activity_level', 'moderate')
+    
+    # Create personalized context
+    profile_context = f"""
+    User Profile:
+    - Age: {age}
+    - Medical conditions: {', '.join(medical_conditions) if medical_conditions else 'None reported'}
+    - Allergies: {', '.join(allergies) if allergies else 'None reported'}
+    - Activity level: {activity_level}
+    """
+    
+    # Generate personalized advice using AI
+    personalized_prompt = f"""
+    Based on the following user profile, provide specific, personalized health advice for this question: "{user_prompt}"
+    
+    {profile_context}
+    
+    Please provide:
+    1. Specific advice tailored to their age group
+    2. Considerations for their medical conditions (if any)
+    3. Allergy-related precautions (if applicable)
+    4. Activity modifications based on their fitness level
+    
+    Keep the advice practical, actionable, and focused on their specific health profile.
+    Format as a clear, concise response under 200 words.
+    """
+    
+    try:
+        response = llm.generate_content(personalized_prompt)
+        advice_text = response.text.strip()
+        
+        return {
+            "title": "Personalized Health Advice",
+            "advice": advice_text,
+            "profile_based": True,
+            "considerations": {
+                "age_group": get_age_group_advice(age),
+                "medical_conditions": medical_conditions,
+                "allergies": allergies,
+                "activity_level": activity_level
+            }
+        }
+    except Exception as e:
+        print(f"Error generating personalized advice: {e}")
+        return None
+
+def get_age_group_advice(age):
+    """Get age-specific health considerations."""
+    try:
+        age_num = int(age) if age != 'unspecified' else 30
+        if age_num < 13:
+            return "Children need extra protection from air pollution and environmental factors"
+        elif age_num < 20:
+            return "Teenagers should be aware of how air quality affects athletic performance"
+        elif age_num < 65:
+            return "Adults should monitor air quality for work and exercise planning"
+        else:
+            return "Seniors should take extra precautions with air quality and health monitoring"
+    except (ValueError, TypeError):
+        return "Age-appropriate health monitoring recommended"
 
 def handle_general_questions(query_type, user_prompt):
     """Handle general questions that don't require location-specific data."""
@@ -522,6 +929,28 @@ def handle_query():
         if query_type in ['aqi_explanation', 'health_advice', 'general_advice']:
             general_response = handle_general_questions(query_type, user_prompt)
             if general_response:
+                # Add personalized recommendations for general health questions
+                user = get_user_from_token()
+                if user:
+                    user_id = user['user_id']
+                    user_profile = user_profiles.get(user_id)
+                    
+                    if user_profile and any([user_profile.get('age'), user_profile.get('medical_conditions'), 
+                                           user_profile.get('allergies'), user_profile.get('activity_level')]):
+                        # Generate personalized advice for general health questions
+                        personalized_advice = generate_personalized_health_advice(user_prompt, user_profile)
+                        general_response["personalized_recommendations"] = personalized_advice
+                    else:
+                        general_response["personalized_recommendations"] = {
+                            "message": "Create your health profile to receive personalized advice for your specific health conditions.",
+                            "call_to_action": "Click 'Health Profile' to get personalized recommendations!"
+                        }
+                else:
+                    general_response["personalized_recommendations"] = {
+                        "message": "Log in to receive health advice tailored to your personal medical conditions and lifestyle.",
+                        "call_to_action": "Click 'Login' to access personalized features!"
+                    }
+                
                 return jsonify({
                     "explanation": general_response,
                     "coordinates": None,
@@ -551,6 +980,30 @@ def handle_query():
         
         # Add location name to the response
         explanation_json["location_name"] = location_name
+
+        # Always check for user authentication and add personalized recommendations
+        user = get_user_from_token()
+        if user:
+            user_id = user['user_id']
+            user_profile = user_profiles.get(user_id)
+            
+            # Generate personalized recommendations based on user profile
+            if user_profile and any([user_profile.get('age'), user_profile.get('medical_conditions'), 
+                                   user_profile.get('allergies'), user_profile.get('activity_level')]):
+                personalized_rec = generate_personalized_recommendations(aqi_data, user_profile)
+                explanation_json["personalized_recommendations"] = personalized_rec
+            else:
+                # User is authenticated but has no profile - encourage them to create one
+                explanation_json["personalized_recommendations"] = {
+                    "message": "Create your health profile to receive personalized air quality recommendations based on your age, medical conditions, and activity level.",
+                    "call_to_action": "Click 'Health Profile' to get started with personalized advice!"
+                }
+        else:
+            # User is not authenticated - encourage login for personalized features
+            explanation_json["personalized_recommendations"] = {
+                "message": "Log in to receive personalized air quality recommendations tailored to your health profile.",
+                "call_to_action": "Click 'Login' to access personalized health advice!"
+            }
 
         return jsonify({
             "coordinates": coordinates,

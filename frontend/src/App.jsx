@@ -5,6 +5,7 @@ import { useAuth0 } from '@auth0/auth0-react';
 import LoginButton from './components/loginButton';
 import LogoutButton from './components/logoutButton';
 import Profile from './components/profile';
+import UserProfileForm from './components/UserProfileForm';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
@@ -16,8 +17,10 @@ function App() {
     const [map, setMap] = useState(null);
     const [heatmap, setHeatmap] = useState(null);
 
-    const { user, isAuthenticated, loginWithRedirect, logout } = useAuth0();
+    const { user, isAuthenticated, loginWithRedirect, logout, getAccessTokenSilently } = useAuth0();
     const [showProfile, setShowProfile] = useState(false);
+    const [userProfile, setUserProfile] = useState(null);
+    const [showProfileForm, setShowProfileForm] = useState(false);
     const profileRef = useRef(null);
 
     // simple debounce helper for map events
@@ -29,7 +32,72 @@ function App() {
         };
     };
 
-    const handleLocationChange = (e) => setLocation(e.target.value);
+    // Get access token for API calls
+    const getToken = async () => {
+        if (!isAuthenticated) return null;
+        try {
+            return await getAccessTokenSilently({
+                authorizationParams: {
+                    audience: import.meta.env.VITE_AUTH0_AUDIENCE,
+                    scope: "read:profile update:profile"
+                }
+            });
+        } catch (error) {
+            console.error('Error getting token:', error);
+            return null;
+        }
+    };
+
+    // Fetch user profile
+    const fetchUserProfile = async () => {
+        if (!isAuthenticated) return;
+        try {
+            const token = await getToken();
+            if (!token) return;
+
+            const response = await fetch('http://localhost:5000/api/user/profile', {
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                setUserProfile(data.profile);
+            }
+        } catch (error) {
+            console.error('Error fetching user profile:', error);
+        }
+    };
+
+    // Update user profile
+    const updateUserProfile = async (profileData) => {
+        if (!isAuthenticated) return;
+        try {
+            const token = await getToken();
+            if (!token) return;
+
+            const response = await fetch('http://localhost:5000/api/user/profile', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(profileData)
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                setUserProfile(data.profile);
+                setShowProfileForm(false);
+                return true;
+            }
+        } catch (error) {
+            console.error('Error updating user profile:', error);
+        }
+        return false;
+    };    const handleLocationChange = (e) => setLocation(e.target.value);
 
     const handleSearch = async () => {
         if (location.trim() === '') return;
@@ -98,9 +166,16 @@ function App() {
         setInput('');
 
         try {
+            // Get auth token for authenticated requests
+            const token = await getToken();
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+
             const response = await fetch('/api/query', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: headers,
                 body: JSON.stringify({ prompt: messageText }),
             });
 
@@ -120,7 +195,7 @@ function App() {
                 try {
                     const forecastResponse = await fetch('/api/forecast', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: headers, // Use the same headers with auth token
                         body: JSON.stringify({ 
                             lat: data.coordinates.lat, 
                             lng: data.coordinates.lng 
@@ -277,46 +352,67 @@ function App() {
                 </div>
             </div>
             <div className="w-1/3 h-full flex flex-col bg-gray-800 border-l border-gray-700">
-                <div className="p-4 border-b border-gray-700 flex justify-between items-center">
-                    <div className="flex items-center space-x-3">
-                        <img src="/respire-logo.svg" alt="Respire Logo" className="w-8 h-8" />
-                        <h1 className="text-2xl font-bold text-teal-400">Respire</h1>
+                <div className="p-4 border-b border-gray-700">
+                    {/* Top row with logo and profile */}
+                    <div className="flex justify-between items-center mb-2">
+                        <div className="flex items-center space-x-3">
+                            <img src="/respire-logo.svg" alt="Respire Logo" className="rounded-full w-8 h-8" />
+                            <h1 className="text-2xl font-bold text-teal-400">Respire</h1>
+                        </div>
+                        {isAuthenticated && <Profile />}
                     </div>
-                    <div className="flex space-x-2 items-center">
+                    
+                    {/* Bottom row with auth controls */}
+                    <div className="flex justify-end items-center space-x-2">
                         {!isAuthenticated ? (
                             <LoginButton />
                         ) : (
                             <>
+                                <button
+                                    onClick={() => setShowProfileForm(!showProfileForm)}
+                                    className="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs font-medium transition-colors"
+                                    title="Manage your health profile for personalized recommendations"
+                                >
+                                    {showProfileForm ? '← Chat' : '⚕️ Health Profile'}
+                                </button>
                                 <LogoutButton />
-                                <Profile />
                             </>
                         )}
                     </div>
                 </div>
                 <div className="flex-1 p-4 overflow-y-auto">
-                    {messages.length === 0 && (
-                        <div className="mb-6">
-                            <h3 className="text-lg font-semibold text-white mb-3">Try asking me:</h3>
-                            <div className="grid grid-cols-1 gap-2">
-                                {[
-                                    "What is AQI?",
-                                    "Air quality in New York",
-                                    "What should I do if I have asthma?",
-                                    "How to protect myself from air pollution?",
-                                    "Air quality in London",
-                                    "Health advice for heart conditions"
-                                ].map((question, i) => (
-                                    <button
-                                        key={i}
-                                        onClick={() => handleSendMessage(question)}
-                                        className="text-left p-3 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm text-gray-300 hover:text-white transition-colors"
-                                    >
-                                        💬 {question}
-                                    </button>
-                                ))}
-                            </div>
+                    {showProfileForm ? (
+                        <div className="h-full">
+                            <UserProfileForm 
+                                userProfile={userProfile} 
+                                onProfileUpdate={setUserProfile}
+                            />
                         </div>
-                    )}
+                    ) : (
+                        <>
+                            {messages.length === 0 && (
+                                <div className="mb-6">
+                                    <h3 className="text-lg font-semibold text-white mb-3">Try asking me:</h3>
+                                    <div className="grid grid-cols-1 gap-2">
+                                        {[
+                                            "What is AQI?",
+                                            "Air quality in New York",
+                                            "What should I do if I have asthma?",
+                                            "How to protect myself from air pollution?",
+                                            "Air quality in London",
+                                            "Health advice for heart conditions"
+                                        ].map((question, i) => (
+                                            <button
+                                                key={i}
+                                                onClick={() => handleSendMessage(question)}
+                                                className="text-left p-3 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm text-gray-300 hover:text-white transition-colors"
+                                            >
+                                                💬 {question}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
                     {messages.map((msg, index) => (
                         <div key={index} className={`mb-4 flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
                             <div className={`p-4 rounded-lg ${msg.sender === 'user' ? 'bg-blue-600 max-w-md' : 'bg-gray-700 w-full'}`}>
@@ -368,6 +464,47 @@ function App() {
                                                         </div>
                                                     </div>
                                                 </div>
+
+                                                {/* Personalized Recommendations */}
+                                                {msg.personalized_recommendations && (
+                                                    <div className="bg-gradient-to-r from-purple-600 to-blue-600 p-3 rounded-lg border-2 border-purple-400">
+                                                        <h4 className="font-semibold text-white mb-2 flex items-center">
+                                                            <span className="mr-2">👤</span>
+                                                            Personalized for You
+                                                        </h4>
+                                                        {msg.personalized_recommendations.title && msg.personalized_recommendations.age_specific ? (
+                                                            <div className="space-y-2 text-sm text-white">
+                                                                {msg.personalized_recommendations.age_specific && msg.personalized_recommendations.age_specific.length > 0 && (
+                                                                    <div>
+                                                                        <span className="font-semibold text-yellow-300">Age-specific: </span>
+                                                                        <span>{msg.personalized_recommendations.age_specific.join('; ')}</span>
+                                                                    </div>
+                                                                )}
+                                                                {msg.personalized_recommendations.condition_specific && msg.personalized_recommendations.condition_specific.length > 0 && (
+                                                                    <div>
+                                                                        <span className="font-semibold text-red-300">Medical conditions: </span>
+                                                                        <span>{msg.personalized_recommendations.condition_specific.join('; ')}</span>
+                                                                    </div>
+                                                                )}
+                                                                {msg.personalized_recommendations.activity_specific && msg.personalized_recommendations.activity_specific.length > 0 && (
+                                                                    <div>
+                                                                        <span className="font-semibold text-green-300">Activity advice: </span>
+                                                                        <span>{msg.personalized_recommendations.activity_specific.join('; ')}</span>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        ) : msg.personalized_recommendations.advice ? (
+                                                            <div className="text-sm text-white">
+                                                                <p>{msg.personalized_recommendations.advice}</p>
+                                                            </div>
+                                                        ) : (
+                                                            <div className="text-sm text-white">
+                                                                <p className="mb-2">{msg.personalized_recommendations.message}</p>
+                                                                <p className="text-yellow-300 font-semibold">{msg.personalized_recommendations.call_to_action}</p>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
                                             </div>
 
                                             {/* Detailed Pollutant Breakdown */}
@@ -502,6 +639,35 @@ function App() {
                                                 </ul>
                                             </div>
 
+                                            {/* Personalized Recommendations for Educational Content */}
+                                            {msg.personalized_recommendations && (
+                                                <div className="bg-gradient-to-r from-purple-600 to-blue-600 p-3 rounded-lg border-2 border-purple-400">
+                                                    <h4 className="font-semibold text-white mb-2 flex items-center">
+                                                        <span className="mr-2">👤</span>
+                                                        Personalized for You
+                                                    </h4>
+                                                    {msg.personalized_recommendations.advice ? (
+                                                        <div className="text-sm text-white">
+                                                            <p className="mb-2">{msg.personalized_recommendations.advice}</p>
+                                                            {msg.personalized_recommendations.considerations && (
+                                                                <div className="text-xs text-gray-200 mt-2 p-2 bg-black bg-opacity-20 rounded">
+                                                                    Based on your profile: Age {msg.personalized_recommendations.considerations.age_group}, 
+                                                                    Activity: {msg.personalized_recommendations.considerations.activity_level}
+                                                                    {msg.personalized_recommendations.considerations.medical_conditions.length > 0 && 
+                                                                        `, Conditions: ${msg.personalized_recommendations.considerations.medical_conditions.join(', ')}`
+                                                                    }
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ) : (
+                                                        <div className="text-sm text-white">
+                                                            <p className="mb-2">{msg.personalized_recommendations.message}</p>
+                                                            <p className="text-yellow-300 font-semibold">{msg.personalized_recommendations.call_to_action}</p>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+
                                             {msg.content.warning_signs && (
                                                 <div className="bg-red-900 bg-opacity-20 border border-red-500 p-3 rounded-lg">
                                                     <h4 className="font-semibold text-red-400 mb-2">Warning Signs to Watch For</h4>
@@ -584,24 +750,28 @@ function App() {
                             </div>
                         </div>
                     ))}
+                        </>
+                    )}
                 </div>
-                <div className="p-4 border-t border-gray-700">
-                    <div className="flex">
-                        <input
-                            type="text" value={input}
-                            onChange={(e) => setInput(e.target.value)}
-                            onKeyPress={(e) => e.key === 'Enter' && handleSendMessage(input)}
-                            placeholder="Ask a follow-up question..."
-                            className="flex-1 p-3 rounded-l-lg bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-teal-400"
-                        />
-                        <button
-                            onClick={() => handleSendMessage(input)}
-                            className="px-6 py-3 bg-teal-500 rounded-r-lg hover:bg-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-400 font-semibold"
-                        >
-                            Send
-                        </button>
+                {!showProfileForm && (
+                    <div className="p-4 border-t border-gray-700">
+                        <div className="flex">
+                            <input
+                                type="text" value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                onKeyPress={(e) => e.key === 'Enter' && handleSendMessage(input)}
+                                placeholder="Ask a follow-up question..."
+                                className="flex-1 p-3 rounded-l-lg bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-teal-400"
+                            />
+                            <button
+                                onClick={() => handleSendMessage(input)}
+                                className="px-6 py-3 bg-teal-500 rounded-r-lg hover:bg-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-400 font-semibold"
+                            >
+                                Send
+                            </button>
+                        </div>
                     </div>
-                </div>
+                )}
             </div>
         </div>
     );
