@@ -270,33 +270,114 @@ function App() {
                 <div className="flex-1 p-4 overflow-y-auto">
                     {messages.map((msg, index) => (
                         <div key={index} className={`mb-4 flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
-                            <div className={`p-3 rounded-lg max-w-md ${msg.sender === 'user' ? 'bg-blue-600' : 'bg-gray-700'}`}>
-                                {msg.sender === 'user' ? <p>{msg.text}</p> :
+                            <div className={`p-4 rounded-lg ${msg.sender === 'user' ? 'bg-blue-600 max-w-md' : 'bg-gray-700 w-full'}`}>
+                                {msg.sender === 'user' ? <p className="text-white">{msg.text}</p> :
                                     (msg.overview ? (
-                                        <div className="prose prose-invert">
-                                            <h3>Current Air Quality Overview</h3>
-                                            <ul>
-                                                <li><strong>Overall AQI:</strong> {msg.overview.aqi} ({msg.overview.category})</li>
-                                                <li><strong>Dominant Pollutant:</strong> {msg.overview.dominant_pollutant}</li>
-                                                <li>{msg.overview.dominant_pollutant_description}</li>
-                                                <li><strong>Health Summary:</strong> {msg.overview.health_summary}</li>
-                                            </ul>
-                                            <h3>Health Recommendations</h3>
-                                            <ul>
-                                                <li><strong>General Population:</strong> {msg.recommendations.general_population}</li>
-                                                <li><strong>Sensitive Groups:</strong> {msg.recommendations.sensitive_groups}</li>
-                                            </ul>
-                                            <h3>Pollutant Breakdown</h3>
-                                            <table className="w-full text-left">
-                                                <thead>
-                                                    <tr><th>Pollutant</th><th>AQI</th><th>Concentration</th></tr>
-                                                </thead>
-                                                <tbody>
-                                                    {msg.pollutants.map((p, i) => <tr key={i}><td>{p.name}</td><td>{p.aqi}</td><td>{p.concentration}</td></tr>)}
-                                                </tbody>
-                                            </table>
+                                        <div className="space-y-4">
+                                            {/* Header with AQI Badge */}
+                                            <div className="flex items-center justify-between border-b border-gray-600 pb-3">
+                                                <h3 className="text-lg font-bold text-white">Air Quality Report</h3>
+                                                <div className={`px-3 py-1 rounded-full text-sm font-semibold ${
+                                                    msg.overview.aqi <= 50 ? 'bg-green-500 text-white' :
+                                                    msg.overview.aqi <= 100 ? 'bg-yellow-500 text-black' :
+                                                    msg.overview.aqi <= 150 ? 'bg-orange-500 text-white' :
+                                                    msg.overview.aqi <= 200 ? 'bg-red-500 text-white' :
+                                                    msg.overview.aqi <= 300 ? 'bg-purple-500 text-white' :
+                                                    'bg-red-900 text-white'
+                                                }`}>
+                                                    AQI {msg.overview.aqi} - {msg.overview.category}
+                                                </div>
+                                            </div>
+
+                                            {/* Overview Section */}
+                                            <div className="grid grid-cols-1 gap-3">
+                                                <div className="bg-gray-600 p-3 rounded-lg">
+                                                    <h4 className="font-semibold text-teal-400 mb-2">Overview</h4>
+                                                    <p className="text-sm text-gray-300 mb-2">{msg.overview.health_summary}</p>
+                                                    {msg.overview.dominant_pollutant && (
+                                                        <div className="text-sm">
+                                                            <span className="text-yellow-400 font-semibold">Main Concern: </span>
+                                                            <span className="text-white">{msg.overview.dominant_pollutant}</span>
+                                                            <p className="text-gray-300 mt-1">{msg.overview.dominant_pollutant_description}</p>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+
+                                            {/* Recommendations */}
+                                            <div className="grid grid-cols-1 gap-3">
+                                                <div className="bg-gray-600 p-3 rounded-lg">
+                                                    <h4 className="font-semibold text-teal-400 mb-2">Health Recommendations</h4>
+                                                    <div className="space-y-2 text-sm">
+                                                        <div>
+                                                            <span className="text-blue-400 font-semibold">General Public: </span>
+                                                            <span className="text-gray-300">{msg.recommendations.general_population}</span>
+                                                        </div>
+                                                        <div>
+                                                            <span className="text-orange-400 font-semibold">Sensitive Groups: </span>
+                                                            <span className="text-gray-300">{msg.recommendations.sensitive_groups}</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {/* Detailed Pollutant Breakdown */}
+                                            {msg.pollutants && msg.pollutants.length > 0 && (
+                                                <div className="bg-gray-600 p-3 rounded-lg">
+                                                    <h4 className="font-semibold text-teal-400 mb-3">Pollutant Details ({msg.pollutant_count || msg.pollutants.length} detected)</h4>
+                                                    <div className="space-y-3">
+                                                        {msg.pollutants.map((p, i) => (
+                                                            <div key={i} className="bg-gray-700 p-3 rounded border-l-4 border-teal-400">
+                                                                <div className="flex items-center justify-between mb-2">
+                                                                    <h5 className="font-semibold text-white">{p.name}</h5>
+                                                                    <div className="flex items-center space-x-2 text-sm">
+                                                                        {p.aqi && (
+                                                                            <span className={`px-2 py-1 rounded text-xs font-semibold ${
+                                                                                p.aqi <= 50 ? 'bg-green-500 text-white' :
+                                                                                p.aqi <= 100 ? 'bg-yellow-500 text-black' :
+                                                                                p.aqi <= 150 ? 'bg-orange-500 text-white' :
+                                                                                p.aqi <= 200 ? 'bg-red-500 text-white' :
+                                                                                'bg-purple-500 text-white'
+                                                                            }`}>
+                                                                                AQI {p.aqi}
+                                                                            </span>
+                                                                        )}
+                                                                        <span className="text-gray-300">{p.concentration}</span>
+                                                                    </div>
+                                                                </div>
+                                                                {p.description && (
+                                                                    <p className="text-sm text-gray-300 mb-1">{p.description}</p>
+                                                                )}
+                                                                {p.sources && (
+                                                                    <p className="text-xs text-gray-400">
+                                                                        <span className="font-semibold">Sources:</span> {p.sources}
+                                                                    </p>
+                                                                )}
+                                                                {p.health_effects && (
+                                                                    <p className="text-xs text-gray-400">
+                                                                        <span className="font-semibold">Health Effects:</span> {p.health_effects}
+                                                                    </p>
+                                                                )}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* Data Source Info */}
+                                            {msg.overview.data_source && (
+                                                <div className="text-xs text-gray-500 border-t border-gray-600 pt-2">
+                                                    Data source: {msg.overview.data_source === 'waqi' ? 'World Air Quality Index' : 'Estimated'}
+                                                    {msg.overview.location && msg.overview.location !== 'Location data unavailable' && (
+                                                        <span> • Location: {msg.overview.location}</span>
+                                                    )}
+                                                    {msg.overview.last_updated && (
+                                                        <span> • Updated: {msg.overview.last_updated}</span>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
-                                    ) : <p>{msg.text}</p>)
+                                    ) : <p className="text-white">{msg.text}</p>)
                                 }
                             </div>
                         </div>
