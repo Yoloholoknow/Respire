@@ -9,8 +9,7 @@ const clientId = import.meta.env.VITE_APP_AUTH0_CLIENT_ID;
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
-    <App />
-    <Auth0Provider
+        <Auth0Provider
       domain={domain}
       clientId={clientId}
       redirectUri={window.location.origin}
