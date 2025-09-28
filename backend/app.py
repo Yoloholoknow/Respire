@@ -5,6 +5,10 @@ import requests
 from dotenv import load_dotenv
 import json
 import traceback
+from functools import wraps
+from jose import jwt, JWTError
+from urllib.request import urlopen
+from flask_cors import CORS
 
 # Load environment variables from a .env file
 load_dotenv()
@@ -25,8 +29,118 @@ except (ValueError, Exception) as e:
 MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 WAQI_API_TOKEN = os.environ.get("WAQI_API_TOKEN")
 
+# Auth0 Configuration
+AUTH0_DOMAIN = os.environ.get("AUTH0_DOMAIN")
+AUTH0_API_AUDIENCE = os.environ.get("AUTH0_API_AUDIENCE")
+AUTH0_ALGORITHMS = ["RS256"]
+
+# Auth0 Configuration
+AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN')
+AUTH0_API_AUDIENCE = os.environ.get('AUTH0_API_AUDIENCE')
+ALGORITHMS = ["RS256"]
+
 # --- Flask App Initialization ---
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all domains
+
+# In-memory user profiles storage (in production, use a database)
+user_profiles = {}
+
+# --- Auth0 Helper Functions ---
+
+def get_token_auth_header():
+    """Obtains the Access Token from the Authorization Header"""
+    auth = request.headers.get("Authorization", None)
+    print(f"Authorization header: {auth}")  # Debug
+    if not auth:
+        print("No Authorization header found")  # Debug
+        return None
+    
+    parts = auth.split()
+    if parts[0].lower() != "bearer":
+        print(f"Invalid auth type: {parts[0]}")  # Debug
+        return None
+    elif len(parts) == 1:
+        print("No token found in Authorization header")  # Debug
+        return None
+    elif len(parts) > 2:
+        print("Malformed Authorization header")  # Debug
+        return None
+    
+    token = parts[1]
+    print(f"Token extracted: {token[:20]}...")  # Debug (first 20 chars)
+    return token
+
+def verify_decode_jwt(token):
+    """Verifies and decodes the JWT token"""
+    print(f"AUTH0_DOMAIN: {AUTH0_DOMAIN}")  # Debug
+    print(f"AUTH0_API_AUDIENCE: {AUTH0_API_AUDIENCE}")  # Debug
+    
+    if not AUTH0_DOMAIN or not AUTH0_API_AUDIENCE:
+        print("Missing AUTH0_DOMAIN or AUTH0_API_AUDIENCE")  # Debug
+        return None
+        
+    try:
+        # Use requests library for better SSL handling
+        response = requests.get(f"https://{AUTH0_DOMAIN}/.well-known/jwks.json")
+        response.raise_for_status()
+        jwks = response.json()
+        print("Successfully fetched JWKS")  # Debug
+        
+        unverified_header = jwt.get_unverified_header(token)
+        print(f"Token header: {unverified_header}")  # Debug
+        rsa_key = {}
+        
+        for key in jwks["keys"]:
+            if key["kid"] == unverified_header["kid"]:
+                rsa_key = {
+                    "kty": key["kty"],
+                    "kid": key["kid"],
+                    "use": key["use"],
+                    "n": key["n"],
+                    "e": key["e"]
+                }
+                break
+        
+        if rsa_key:
+            print("RSA key found, attempting to decode...")  # Debug
+            payload = jwt.decode(
+                token,
+                rsa_key,
+                algorithms=AUTH0_ALGORITHMS,
+                audience=AUTH0_API_AUDIENCE,
+                issuer=f"https://{AUTH0_DOMAIN}/"
+            )
+            print(f"Token decoded successfully: {payload.get('sub')}")  # Debug
+            return payload
+        else:
+            print("No matching RSA key found")  # Debug
+    except JWTError as e:
+        print(f"JWT Error: {e}")  # Debug
+        return None
+    except Exception as e:
+        print(f"General error in JWT verification: {e}")  # Debug
+        return None
+    
+    return None
+
+def get_user_from_token():
+    """Extract user info from token if present"""
+    token = get_token_auth_header()
+    if not token:
+        return None
+    
+    payload = verify_decode_jwt(token)
+    print(f"JWT payload: {payload}")  # Debug
+    if payload:
+        return {
+            'user_id': payload.get('sub'),
+            'email': payload.get('email'),
+            'name': payload.get('name'),
+            'picture': payload.get('picture'),
+            'user_metadata': payload.get('https://respire-app.com/user_metadata', {})  # Custom claim
+        }
+    return None
 
 # --- Helper Functions ---
 
@@ -332,6 +446,82 @@ def format_air_quality_data(aqi_data):
 
 # --- API Endpoints ---
 
+@app.route('/api/test-auth', methods=['GET'])
+def test_auth():
+    """Test authentication and show token info"""
+    user = get_user_from_token()
+    return jsonify({
+        'authenticated': user is not None,
+        'user': user,
+        'headers': dict(request.headers)
+    })
+
+@app.route('/api/user/profile', methods=['GET'])
+def get_user_profile():
+    """Get user profile data."""
+    user = get_user_from_token()
+    if not user:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    user_id = user['user_id']
+    profile = user_profiles.get(user_id, {
+        'age': None,
+        'medical_conditions': [],
+        'allergies': [],
+        'medications': [],
+        'activity_level': 'moderate',
+        'location': None
+    })
+    
+    return jsonify({
+        'user_info': user,
+        'profile': profile
+    })
+
+@app.route('/api/user/profile', methods=['POST'])
+def update_user_profile():
+    """Update user profile data."""
+    print(f"POST /api/user/profile - Headers: {dict(request.headers)}")  # Debug
+    user = get_user_from_token()
+    print(f"User from token: {user}")  # Debug
+    if not user:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    data = request.get_json()
+    user_id = user['user_id']
+    
+    # Validate and sanitize input
+    profile = {
+        'age': data.get('age'),
+        'medical_conditions': data.get('medical_conditions', []),
+        'allergies': data.get('allergies', []),
+        'medications': data.get('medications', []),
+        'activity_level': data.get('activity_level', 'moderate'),
+        'location': data.get('location')
+    }
+    
+    # Validate age
+    if profile['age'] is not None:
+        try:
+            age = int(profile['age'])
+            if age < 0 or age > 120:
+                return jsonify({"error": "Invalid age"}), 400
+            profile['age'] = age
+        except (ValueError, TypeError):
+            return jsonify({"error": "Age must be a number"}), 400
+    
+    # Validate activity level
+    valid_activity_levels = ['low', 'moderate', 'high', 'very_high']
+    if profile['activity_level'] not in valid_activity_levels:
+        profile['activity_level'] = 'moderate'
+    
+    user_profiles[user_id] = profile
+    
+    return jsonify({
+        'message': 'Profile updated successfully',
+        'profile': profile
+    })
+
 @app.route('/api/geocode', methods=['POST'])
 def geocode_location():
     """Geocodes a location name to latitude and longitude."""
@@ -352,24 +542,344 @@ def classify_query_type(user_prompt):
     """Classify the type of user query to determine how to handle it."""
     prompt_lower = user_prompt.lower()
     
-    # General AQI questions
-    if any(phrase in prompt_lower for phrase in ['what is aqi', 'what does aqi mean', 'explain aqi', 'air quality index']):
+    # Check if query is outside air quality domain
+    out_of_domain_keywords = [
+        'weather', 'temperature', 'rain', 'snow', 'storm', 'hurricane', 'tornado',
+        'cooking', 'recipe', 'food', 'restaurant', 'diet', 'nutrition',
+        'sports scores', 'news', 'politics', 'election', 'stock', 'finance',
+        'movie', 'music', 'entertainment', 'celebrity', 'travel booking',
+        'shopping', 'price', 'buy', 'sell', 'product review',
+        'programming', 'code', 'software', 'app development',
+        'relationship', 'dating', 'marriage', 'family problems',
+        'legal advice', 'lawyer', 'court', 'lawsuit',
+        'homework', 'essay', 'assignment', 'school project'
+    ]
+    
+    # Air quality related keywords - comprehensive coverage
+    air_quality_keywords = [
+        'air', 'pollution', 'aqi', 'quality', 'smog', 'haze', 'particulate',
+        'pm2.5', 'pm10', 'ozone', 'o3', 'nitrogen', 'sulfur', 'carbon monoxide',
+        'pollutant', 'emission', 'breathing', 'respiratory', 'lung',
+        'asthma', 'copd', 'allergy', 'pollen', 'dust', 'mold', 'indoor air',
+        'air purifier', 'filter', 'ventilation', 'hvac', 'clean air',
+        'toxic', 'hazardous', 'unhealthy', 'wildfire', 'smoke', 'industrial',
+        # Additional comprehensive keywords
+        'atmosphere', 'atmospheric', 'environment', 'environmental', 'contamination',
+        'contaminant', 'aerosol', 'particle', 'particles', 'fine particles',
+        'coarse particles', 'visibility', 'visibility reduction', 'air index',
+        'air monitoring', 'air sensor', 'air measurement', 'air data',
+        'clean', 'dirty', 'fresh', 'stale', 'stuffy', 'breathable',
+        'health', 'healthy', 'safe', 'safety', 'dangerous', 'harmful',
+        'good air', 'bad air', 'poor air', 'excellent air', 'moderate air',
+        'sensitive groups', 'vulnerable', 'exposure', 'inhale', 'inhalation',
+        'outdoor air', 'ambient air', 'surrounding air', 'local air'
+    ]
+    
+    # Check for out-of-domain queries first
+    if any(keyword in prompt_lower for keyword in out_of_domain_keywords):
+        # But still allow if it's air quality related
+        if not any(keyword in prompt_lower for keyword in air_quality_keywords):
+            return 'out_of_domain'
+    
+    # Pollutant-specific questions
+    if any(phrase in prompt_lower for phrase in ['ozone', 'o3', 'ground level ozone', 'tropospheric ozone']):
+        return 'ozone_questions'
+    
+    if any(phrase in prompt_lower for phrase in ['pm2.5', 'pm 2.5', 'fine particles', 'particulate matter']):
+        return 'particulate_questions'
+    
+    if any(phrase in prompt_lower for phrase in ['nitrogen dioxide', 'no2', 'nitrogen oxide']):
+        return 'nitrogen_questions'
+    
+    if any(phrase in prompt_lower for phrase in ['sulfur dioxide', 'so2', 'sulfur']):
+        return 'sulfur_questions'
+    
+    if any(phrase in prompt_lower for phrase in ['carbon monoxide', 'co', 'carbon']):
+        return 'carbon_monoxide_questions'
+    
+    # Allergy and pollen questions
+    if any(phrase in prompt_lower for phrase in ['pollen', 'allergy', 'allergies', 'hay fever', 'seasonal allergy', 'allergic reaction']):
+        return 'allergy_pollen_advice'
+    
+    # Indoor air quality questions
+    if any(phrase in prompt_lower for phrase in ['indoor air', 'home air', 'house air', 'air purifier', 'hvac', 'ventilation']):
+        return 'indoor_air_advice'
+    
+    # Wildfire and smoke questions
+    if any(phrase in prompt_lower for phrase in ['wildfire', 'forest fire', 'smoke', 'fire smoke', 'ash']):
+        return 'wildfire_smoke_advice'
+    
+    # General AQI questions - much broader coverage
+    if any(phrase in prompt_lower for phrase in [
+        'what is aqi', 'what does aqi mean', 'explain aqi', 'air quality index', 'aqi scale',
+        'aqi range', 'good aqi', 'bad aqi', 'safe aqi', 'healthy aqi', 'aqi level', 'aqi value',
+        'what is a good aqi', 'what is safe aqi', 'normal aqi', 'acceptable aqi', 'aqi guidelines',
+        'aqi standards', 'aqi categories', 'aqi meaning', 'how to read aqi', 'understand aqi'
+    ]):
         return 'aqi_explanation'
     
     # Health condition questions
     if any(phrase in prompt_lower for phrase in ['asthma', 'copd', 'heart condition', 'respiratory', 'pregnant', 'elderly', 'child']):
         return 'health_advice'
     
-    # Trend questions
-    if any(phrase in prompt_lower for phrase in ['trend', 'getting better', 'getting worse', 'improving', 'forecast']):
+    # Protective measures and safety
+    if any(phrase in prompt_lower for phrase in ['mask', 'n95', 'protection', 'how to protect', 'what should i do', 'safety tips', 'recommendations']):
+        return 'protection_advice'
+    
+    # Exercise and outdoor activity questions
+    if any(phrase in prompt_lower for phrase in ['exercise', 'running', 'jogging', 'outdoor activity', 'sports', 'workout']):
+        return 'exercise_advice'
+    
+    # Trend and forecast questions
+    if any(phrase in prompt_lower for phrase in ['trend', 'getting better', 'getting worse', 'improving', 'forecast', 'prediction']):
         return 'trend_analysis'
     
-    # General air quality questions
-    if any(phrase in prompt_lower for phrase in ['how to protect', 'what should i do', 'safety tips', 'recommendations']):
-        return 'general_advice'
+    # General air quality questions - catch common patterns
+    if any(phrase in prompt_lower for phrase in [
+        'what is good', 'what is bad', 'what is safe', 'what is healthy', 'what is normal',
+        'how much', 'how many', 'what level', 'what range', 'what value',
+        'is it safe', 'is it healthy', 'is it dangerous', 'is it harmful',
+        'should i worry', 'should i be concerned', 'is this normal', 'is this good',
+        'what does this mean', 'what does it mean', 'explain this', 'tell me about',
+        'how bad is', 'how good is', 'how safe is', 'how dangerous is'
+    ]) and any(keyword in prompt_lower for keyword in ['air', 'aqi', 'pollution', 'quality', 'ozone', 'pm', 'particulate']):
+        return 'general_air_quality'
     
-    # Location-specific queries (default)
-    return 'location_query'
+    # Location-specific queries (only if clearly asking about a specific place with context)
+    location_indicators = ['in ', 'at ', 'near ', 'around ']
+    place_names = [' city', ' country', ' state', ' province', ' town', ' area', ' region']
+    
+    # Must have both location indicator AND place name AND air quality context
+    has_location_indicator = any(phrase in prompt_lower for phrase in location_indicators)
+    has_place_name = any(phrase in prompt_lower for phrase in place_names)
+    has_air_quality_context = any(phrase in prompt_lower for phrase in ['air quality', 'aqi', 'pollution'])
+    
+    if has_location_indicator and (has_place_name or any(word in prompt_lower.split() for word in ['beijing', 'london', 'tokyo', 'paris', 'york', 'angeles', 'francisco', 'chicago', 'boston', 'seattle', 'miami', 'dallas'])) and has_air_quality_context:
+        return 'location_query'
+    
+    # If it contains air quality keywords but doesn't fit other categories
+    if any(keyword in prompt_lower for keyword in air_quality_keywords):
+        return 'general_air_quality'
+    
+    # Default to out of domain if nothing matches
+    return 'out_of_domain'
+
+def generate_personalized_recommendations(aqi_data, user_profile):
+    """Generate personalized health recommendations based on user profile."""
+    if not user_profile:
+        return None
+    
+    age = user_profile.get('age')
+    medical_conditions = user_profile.get('medical_conditions', [])
+    allergies = user_profile.get('allergies', [])
+    activity_level = user_profile.get('activity_level', 'moderate')
+    
+    aqi = aqi_data.get('aqi', 0)
+    
+    recommendations = {
+        'title': 'Personalized Recommendations',
+        'age_specific': [],
+        'condition_specific': [],
+        'activity_specific': [],
+        'urgent_warnings': []
+    }
+    
+    # Age-specific recommendations
+    if age:
+        if age < 18:
+            recommendations['age_specific'].extend([
+                'Children are more sensitive to air pollution due to developing lungs',
+                'Limit outdoor sports and activities when AQI > 100',
+                'Ensure you stay hydrated and take frequent breaks indoors'
+            ])
+            if aqi > 150:
+                recommendations['urgent_warnings'].append('Avoid all outdoor activities when AQI exceeds 150')
+        elif age >= 65:
+            recommendations['age_specific'].extend([
+                'Older adults are at higher risk for air pollution-related health effects',
+                'Consider postponing outdoor activities when AQI > 100',
+                'Keep rescue medications easily accessible'
+            ])
+            if aqi > 100:
+                recommendations['urgent_warnings'].append('Stay indoors and keep windows closed when AQI > 100')
+        elif 18 <= age < 65:
+            if aqi > 150:
+                recommendations['age_specific'].append('Reduce strenuous outdoor activities and consider indoor alternatives')
+    
+    # Medical condition-specific recommendations
+    condition_recommendations = {
+        'asthma': {
+            'general': [
+                'Keep your rescue inhaler with you at all times',
+                'Consider pre-medicating before going outside if recommended by your doctor',
+                'Monitor your symptoms closely and go indoors if they worsen'
+            ],
+            'aqi_thresholds': {
+                50: ['Use air purifiers indoors and keep windows closed'],
+                100: ['Limit outdoor activities and take frequent breaks indoors'],
+                150: ['Avoid all outdoor activities and stay indoors with air conditioning']
+            }
+        },
+        'copd': {
+            'general': [
+                'Use your prescribed medications as directed',
+                'Consider oxygen therapy if recommended by your doctor',
+                'Avoid areas with heavy traffic or industrial pollution'
+            ],
+            'aqi_thresholds': {
+                50: ['Stay indoors during peak pollution hours'],
+                100: ['Avoid all outdoor activities and keep windows closed'],
+                150: ['Emergency action: Stay indoors, use air purifiers, contact doctor if symptoms worsen']
+            }
+        },
+        'heart_disease': {
+            'general': [
+                'Monitor for chest pain, unusual fatigue, or shortness of breath',
+                'Take medications as prescribed',
+                'Avoid strenuous activities during high pollution days'
+            ],
+            'aqi_thresholds': {
+                100: ['Consider indoor exercise alternatives'],
+                150: ['Avoid all outdoor physical activity'],
+                200: ['Stay indoors and contact your doctor if you experience cardiac symptoms']
+            }
+        },
+        'diabetes': {
+            'general': [
+                'Air pollution can affect blood sugar control',
+                'Monitor blood glucose more frequently during high pollution days',
+                'Stay hydrated and take medications as prescribed'
+            ],
+            'aqi_thresholds': {
+                100: ['Limit outdoor activities and monitor blood sugar closely'],
+                150: ['Stay indoors and check blood glucose more frequently']
+            }
+        }
+    }
+    
+    for condition in medical_conditions:
+        condition_lower = condition.lower()
+        if condition_lower in condition_recommendations:
+            rec = condition_recommendations[condition_lower]
+            recommendations['condition_specific'].extend(rec['general'])
+            
+            # Add AQI-specific recommendations
+            for threshold in sorted(rec['aqi_thresholds'].keys()):
+                if aqi >= threshold:
+                    recommendations['condition_specific'].extend(rec['aqi_thresholds'][threshold])
+    
+    # Activity level recommendations
+    activity_recommendations = {
+        'low': {
+            100: ['Gentle indoor activities are recommended'],
+            150: ['Stay indoors and avoid any physical exertion']
+        },
+        'moderate': {
+            100: ['Consider indoor exercise alternatives like yoga or light stretching'],
+            150: ['Replace outdoor workouts with indoor activities']
+        },
+        'high': {
+            50: ['Consider timing outdoor workouts for early morning or late evening'],
+            100: ['Move intense workouts indoors or reschedule for cleaner air days'],
+            150: ['Avoid all outdoor exercise and choose indoor fitness activities']
+        },
+        'very_high': {
+            50: ['Monitor air quality closely and adjust workout intensity'],
+            100: ['Significantly reduce outdoor training intensity or move indoors'],
+            150: ['Cancel outdoor training sessions and use indoor facilities only']
+        }
+    }
+    
+    if activity_level in activity_recommendations:
+        for threshold in sorted(activity_recommendations[activity_level].keys()):
+            if aqi >= threshold:
+                recommendations['activity_specific'].extend(activity_recommendations[activity_level][threshold])
+    
+    # Allergy-specific recommendations
+    if allergies:
+        recommendations['condition_specific'].extend([
+            'Air pollution can worsen allergy symptoms',
+            'Consider taking antihistamines as recommended by your doctor',
+            'Use HEPA air purifiers to reduce indoor allergens'
+        ])
+    
+    # Remove duplicates and empty lists
+    for key in list(recommendations.keys()):
+        if isinstance(recommendations[key], list):
+            recommendations[key] = list(set(recommendations[key]))
+            if not recommendations[key]:
+                del recommendations[key]
+    
+    return recommendations if any(recommendations.values()) else None
+
+def generate_personalized_health_advice(user_prompt, user_profile):
+    """Generate personalized health advice for general health questions."""
+    if not user_profile or not llm:
+        return None
+    
+    age = user_profile.get('age', 'unspecified')
+    medical_conditions = user_profile.get('medical_conditions', [])
+    allergies = user_profile.get('allergies', [])
+    activity_level = user_profile.get('activity_level', 'moderate')
+    
+    # Create personalized context
+    profile_context = f"""
+    User Profile:
+    - Age: {age}
+    - Medical conditions: {', '.join(medical_conditions) if medical_conditions else 'None reported'}
+    - Allergies: {', '.join(allergies) if allergies else 'None reported'}
+    - Activity level: {activity_level}
+    """
+    
+    # Generate personalized advice using AI
+    personalized_prompt = f"""
+    Based on the following user profile, provide specific, personalized health advice for this question: "{user_prompt}"
+    
+    {profile_context}
+    
+    Please provide:
+    1. Specific advice tailored to their age group
+    2. Considerations for their medical conditions (if any)
+    3. Allergy-related precautions (if applicable)
+    4. Activity modifications based on their fitness level
+    
+    Keep the advice practical, actionable, and focused on their specific health profile.
+    Format as a clear, concise response under 200 words.
+    """
+    
+    try:
+        response = llm.generate_content(personalized_prompt)
+        advice_text = response.text.strip()
+        
+        return {
+            "title": "Personalized Health Advice",
+            "advice": advice_text,
+            "profile_based": True,
+            "considerations": {
+                "age_group": get_age_group_advice(age),
+                "medical_conditions": medical_conditions,
+                "allergies": allergies,
+                "activity_level": activity_level
+            }
+        }
+    except Exception as e:
+        print(f"Error generating personalized advice: {e}")
+        return None
+
+def get_age_group_advice(age):
+    """Get age-specific health considerations."""
+    try:
+        age_num = int(age) if age != 'unspecified' else 30
+        if age_num < 13:
+            return "Children need extra protection from air pollution and environmental factors"
+        elif age_num < 20:
+            return "Teenagers should be aware of how air quality affects athletic performance"
+        elif age_num < 65:
+            return "Adults should monitor air quality for work and exercise planning"
+        else:
+            return "Seniors should take extra precautions with air quality and health monitoring"
+    except (ValueError, TypeError):
+        return "Age-appropriate health monitoring recommended"
 
 def handle_general_questions(query_type, user_prompt):
     """Handle general questions that don't require location-specific data."""
@@ -471,7 +981,340 @@ def handle_general_questions(query_type, user_prompt):
                 }
             }
     
-    elif query_type == 'general_advice':
+    elif query_type == 'ozone_questions':
+        return {
+            "type": "pollutant_info",
+            "title": "Understanding Ozone (O₃)",
+            "content": {
+                "what_is_it": "Ground-level ozone is a harmful air pollutant formed when nitrogen oxides and volatile organic compounds react in sunlight.",
+                "health_effects": {
+                    "short_term": ["Throat irritation", "Coughing", "Chest pain", "Shortness of breath", "Worsening of asthma"],
+                    "long_term": ["Reduced lung function", "Increased risk of respiratory infections", "Premature aging of lungs"]
+                },
+                "safe_levels": {
+                    "good": "0-54 ppb (AQI 0-50) - Safe for everyone",
+                    "moderate": "55-70 ppb (AQI 51-100) - Acceptable for most people",
+                    "unhealthy_sensitive": "71-85 ppb (AQI 101-150) - Sensitive groups should limit outdoor activities",
+                    "unhealthy": "86-105 ppb (AQI 151-200) - Everyone should limit outdoor activities"
+                },
+                "protection_tips": [
+                    "Avoid outdoor exercise during peak ozone hours (10 AM - 6 PM)",
+                    "Stay indoors when ozone alerts are issued",
+                    "Choose early morning or evening for outdoor activities",
+                    "Use air conditioning instead of opening windows on high ozone days"
+                ],
+                "who_at_risk": ["Children", "Adults over 65", "People with asthma or lung disease", "Outdoor workers", "Athletes"]
+            }
+        }
+    
+    elif query_type == 'particulate_questions':
+        return {
+            "type": "pollutant_info",
+            "title": "Particulate Matter (PM2.5 & PM10)",
+            "content": {
+                "what_is_it": "Particulate matter consists of tiny particles suspended in air. PM2.5 particles are 2.5 micrometers or smaller, PM10 are 10 micrometers or smaller.",
+                "size_comparison": "PM2.5 is 30 times smaller than the width of a human hair and can penetrate deep into lungs and bloodstream.",
+                "health_effects": {
+                    "pm25": ["Heart attacks", "Irregular heartbeat", "Decreased lung function", "Increased respiratory symptoms", "Premature death"],
+                    "pm10": ["Coughing", "Difficulty breathing", "Irritated eyes/nose/throat", "Aggravated asthma"]
+                },
+                "safe_levels": {
+                    "pm25_daily": "0-12 μg/m³ (AQI 0-50) - Good",
+                    "pm25_unhealthy": "35.5+ μg/m³ (AQI 151+) - Unhealthy for everyone",
+                    "pm10_daily": "0-54 μg/m³ (AQI 0-50) - Good",
+                    "pm10_unhealthy": "155+ μg/m³ (AQI 151+) - Unhealthy for everyone"
+                },
+                "sources": ["Vehicle exhaust", "Power plants", "Industrial processes", "Wildfires", "Dust storms", "Construction"],
+                "protection": [
+                    "Use N95 or P100 masks when PM levels are high",
+                    "Run air purifiers with HEPA filters indoors",
+                    "Avoid outdoor exercise when PM levels exceed 35 μg/m³",
+                    "Keep windows closed during pollution episodes"
+                ]
+            }
+        }
+    
+    elif query_type == 'allergy_pollen_advice':
+        return {
+            "type": "allergy_advice", 
+            "title": "Managing Allergies and Air Quality",
+            "content": {
+                "air_pollution_connection": "Air pollution can worsen allergy symptoms by irritating already inflamed airways and making you more sensitive to allergens.",
+                "double_trouble": "Poor air quality + high pollen = increased allergy symptoms",
+                "management_strategies": {
+                    "indoor": [
+                        "Use HEPA air purifiers to remove both pollutants and allergens",
+                        "Keep windows closed during high pollution and high pollen days",
+                        "Change HVAC filters regularly",
+                        "Remove shoes and wash hands when coming indoors",
+                        "Shower before bed to remove pollen and pollutants"
+                    ],
+                    "outdoor": [
+                        "Check both AQI and pollen counts before going outside",
+                        "Wear wraparound sunglasses to protect eyes",
+                        "Consider N95 masks on high pollution days",
+                        "Avoid outdoor activities when both pollution and pollen are high",
+                        "Choose early morning (6-10 AM) for outdoor activities when possible"
+                    ],
+                    "medication": [
+                        "Take antihistamines as directed by your doctor",
+                        "Use nasal saline rinses to clear pollutants and allergens",
+                        "Keep rescue inhalers accessible if you have asthma",
+                        "Consider starting allergy medications before peak season"
+                    ]
+                },
+                "when_to_seek_help": [
+                    "Allergy symptoms worsen during high pollution days",
+                    "Difficulty breathing or wheezing",
+                    "Symptoms don't improve with usual treatments",
+                    "Development of new respiratory symptoms"
+                ],
+                "pollen_types": {
+                    "spring": "Tree pollen (March-May)",
+                    "summer": "Grass pollen (May-July)", 
+                    "fall": "Weed pollen, especially ragweed (August-October)"
+                }
+            }
+        }
+    
+    elif query_type == 'indoor_air_advice':
+        return {
+            "type": "indoor_air_advice",
+            "title": "Improving Indoor Air Quality",
+            "content": {
+                "why_it_matters": "Americans spend 90% of their time indoors, where air can be 2-5 times more polluted than outdoor air.",
+                "common_indoor_pollutants": [
+                    "Dust mites and pet dander",
+                    "Mold and mildew", 
+                    "Volatile organic compounds (VOCs) from cleaning products",
+                    "Cooking fumes and smoke",
+                    "Formaldehyde from furniture and carpets",
+                    "Radon gas (in some areas)"
+                ],
+                "improvement_strategies": {
+                    "ventilation": [
+                        "Open windows when outdoor air quality is good (AQI < 100)",
+                        "Use exhaust fans in bathrooms and kitchens",
+                        "Ensure HVAC system is properly maintained",
+                        "Consider heat recovery ventilators (HRV) or energy recovery ventilators (ERV)"
+                    ],
+                    "air_purification": [
+                        "Use HEPA air purifiers in main living areas",
+                        "Choose purifiers rated for your room size",
+                        "Replace filters regularly (every 3-6 months)",
+                        "Consider UV-C light purifiers for biological contaminants"
+                    ],
+                    "source_control": [
+                        "Use low-VOC or VOC-free products",
+                        "Store chemicals in sealed containers away from living areas",
+                        "Fix water leaks promptly to prevent mold",
+                        "Vacuum regularly with HEPA filter",
+                        "Maintain humidity between 30-50%"
+                    ]
+                },
+                "plants_that_help": [
+                    "Snake plant (removes formaldehyde)",
+                    "Spider plant (removes carbon monoxide)",
+                    "Peace lily (removes ammonia)",
+                    "Rubber plant (removes formaldehyde)",
+                    "Aloe vera (removes formaldehyde and benzene)"
+                ],
+                "when_outdoor_air_is_bad": [
+                    "Keep windows and doors closed",
+                    "Set HVAC to recirculate mode",
+                    "Run air purifiers continuously",
+                    "Avoid activities that create indoor pollution (cooking, cleaning, smoking)"
+                ]
+            }
+        }
+    
+    elif query_type == 'wildfire_smoke_advice':
+        return {
+            "type": "wildfire_advice",
+            "title": "Protecting Yourself from Wildfire Smoke",
+            "content": {
+                "what_is_wildfire_smoke": "A complex mixture of gases and particles from burning vegetation, containing PM2.5, carbon monoxide, formaldehyde, and other harmful compounds.",
+                "health_effects": {
+                    "immediate": ["Eye and throat irritation", "Coughing", "Runny nose", "Headaches", "Difficulty breathing"],
+                    "serious": ["Chest pain", "Fast heartbeat", "Wheezing", "Severe cough", "Shortness of breath"]
+                },
+                "most_at_risk": [
+                    "People with heart or lung conditions",
+                    "Children under 18",
+                    "Adults over 65", 
+                    "Pregnant women",
+                    "Outdoor workers",
+                    "People experiencing homelessness"
+                ],
+                "protection_strategies": {
+                    "stay_indoors": [
+                        "Keep windows and doors closed",
+                        "Run air conditioning on recirculate mode",
+                        "Use portable air cleaners with HEPA filters",
+                        "Avoid activities that create more particles (smoking, candles, frying)"
+                    ],
+                    "if_you_must_go_outside": [
+                        "Wear N95 or P100 respirator masks",
+                        "Limit outdoor activities and time spent outside",
+                        "Avoid vigorous outdoor exercise",
+                        "Seek indoor shelter as soon as possible"
+                    ],
+                    "diy_air_cleaner": [
+                        "Create a box fan filter using MERV 13 filters",
+                        "Tape filters to intake side of fan",
+                        "Run on medium speed in main living area",
+                        "Can reduce PM2.5 by 50-90% in a room"
+                    ]
+                },
+                "when_to_seek_medical_care": [
+                    "Difficulty breathing or shortness of breath",
+                    "Chest pain or heart palpitations", 
+                    "Severe cough or wheezing",
+                    "Symptoms worsen despite staying indoors"
+                ],
+                "evacuation_considerations": [
+                    "If visibility is less than 5 miles due to smoke",
+                    "If you have respiratory conditions and symptoms worsen",
+                    "If you don't have air conditioning or air cleaners",
+                    "Consider staying with friends/family in cleaner air areas"
+                ]
+            }
+        }
+        
+    elif query_type == 'protection_advice':
+        return {
+            "type": "protection_advice",
+            "title": "Personal Protection from Air Pollution",
+            "content": {
+                "mask_guidance": {
+                    "when_to_wear": "When AQI > 150, during wildfires, or if you're sensitive and AQI > 100",
+                    "n95_masks": {
+                        "effectiveness": "Filters 95% of particles ≥ 0.3 micrometers",
+                        "best_for": "PM2.5, dust, pollen, wildfire smoke",
+                        "fit_tips": ["Check for gaps around edges", "Pinch nose bridge", "Should feel resistance when breathing"]
+                    },
+                    "surgical_masks": {
+                        "effectiveness": "Limited protection against fine particles",
+                        "best_for": "Large droplets, some dust",
+                        "note": "Not recommended for air pollution protection"
+                    },
+                    "p100_masks": {
+                        "effectiveness": "Filters 99.97% of particles",
+                        "best_for": "Severe pollution events, industrial areas",
+                        "note": "More protective but harder to breathe through"
+                    }
+                },
+                "indoor_protection": [
+                    "Create a 'clean room' with air purifier",
+                    "Seal gaps around windows and doors",
+                    "Use high-efficiency furnace filters (MERV 13+)",
+                    "Run bathroom and kitchen exhaust fans",
+                    "Avoid indoor pollution sources"
+                ],
+                "outdoor_strategies": [
+                    "Time outdoor activities for cleaner air periods",
+                    "Choose routes away from busy roads",
+                    "Exercise in parks rather than urban areas",
+                    "Monitor real-time air quality before going out"
+                ],
+                "for_sensitive_groups": {
+                    "children": ["Limit outdoor time when AQI > 100", "Watch for symptoms during play", "Keep rescue medications handy"],
+                    "elderly": ["Stay indoors during poor air quality", "Have emergency plan", "Monitor health closely"],
+                    "lung_conditions": ["Follow action plans", "Have medications accessible", "Consider air quality in daily planning"],
+                    "heart_conditions": ["Avoid outdoor exercise when AQI > 100", "Monitor for chest pain/fatigue", "Consult doctor about air quality concerns"]
+                }
+            }
+        }
+    
+    elif query_type == 'exercise_advice':
+        return {
+            "type": "exercise_advice",
+            "title": "Exercising Safely During Poor Air Quality",
+            "content": {
+                "why_exercise_matters": "Exercise increases breathing rate, causing you to inhale more polluted air deeper into your lungs.",
+                "general_guidelines": {
+                    "good_air": "AQI 0-50: Safe for all outdoor activities",
+                    "moderate_air": "AQI 51-100: Sensitive people should consider reducing prolonged outdoor exertion",
+                    "unhealthy_sensitive": "AQI 101-150: Sensitive groups should move activities indoors",
+                    "unhealthy": "AQI 151-200: Everyone should move activities indoors",
+                    "very_unhealthy": "AQI 201+: Avoid all outdoor activities"
+                },
+                "indoor_alternatives": [
+                    "Home workout videos or apps",
+                    "Gym with good air filtration",
+                    "Mall walking programs",
+                    "Indoor swimming pools",
+                    "Yoga or stretching routines",
+                    "Stair climbing in clean buildings"
+                ],
+                "timing_strategies": {
+                    "best_times": ["Early morning (6-10 AM)", "Late evening after sunset"],
+                    "avoid": ["Rush hour traffic times", "Peak sun hours (10 AM - 4 PM)", "During temperature inversions"],
+                    "check_forecasts": "Air quality often changes throughout the day"
+                },
+                "location_choices": [
+                    "Parks away from busy roads",
+                    "Waterfront areas with better air circulation", 
+                    "Higher elevations when possible",
+                    "Areas upwind from pollution sources",
+                    "Avoid: busy streets, industrial areas, construction zones"
+                ],
+                "warning_signs_to_stop": [
+                    "Unusual coughing or throat irritation",
+                    "Chest tightness or pain",
+                    "Unusual fatigue or shortness of breath",
+                    "Headache or dizziness",
+                    "Eye or nose irritation"
+                ],
+                "special_considerations": {
+                    "athletes": ["Train indoors during poor air quality", "Monitor performance changes", "Stay extra hydrated"],
+                    "beginners": ["Start with indoor activities", "Build fitness before outdoor pollution exposure"],
+                    "children_sports": ["Cancel outdoor practices when AQI > 150", "Watch for symptoms in young athletes"]
+                }
+            }
+        }
+    
+    elif query_type == 'nitrogen_questions':
+        return {
+            "type": "pollutant_info",
+            "title": "Nitrogen Dioxide (NO₂) Information",
+            "content": {
+                "what_is_it": "A reddish-brown gas primarily from vehicle exhaust and power plants that contributes to smog formation.",
+                "health_effects": ["Respiratory irritation", "Increased susceptibility to infections", "Worsening of asthma", "Reduced lung function"],
+                "main_sources": ["Vehicle exhaust", "Power plants", "Industrial facilities", "Gas appliances"],
+                "safe_levels": "EPA standard: 100 ppb (1-hour average), 53 ppb (annual average)",
+                "protection": ["Avoid busy roads during rush hour", "Use exhaust fans with gas appliances", "Support clean transportation policies"]
+            }
+        }
+    
+    elif query_type == 'sulfur_questions':
+        return {
+            "type": "pollutant_info", 
+            "title": "Sulfur Dioxide (SO₂) Information",
+            "content": {
+                "what_is_it": "A colorless gas with a sharp odor, primarily from fossil fuel combustion at power plants and industrial facilities.",
+                "health_effects": ["Respiratory irritation", "Breathing difficulties", "Worsening of asthma", "Eye irritation"],
+                "main_sources": ["Coal-fired power plants", "Oil refineries", "Metal processing", "Volcanic eruptions"],
+                "safe_levels": "EPA standard: 75 ppb (1-hour average)",
+                "protection": ["Stay indoors during high SO₂ episodes", "Use air purifiers", "Support clean energy initiatives"]
+            }
+        }
+    
+    elif query_type == 'carbon_monoxide_questions':
+        return {
+            "type": "pollutant_info",
+            "title": "Carbon Monoxide (CO) Information", 
+            "content": {
+                "what_is_it": "A colorless, odorless gas produced by incomplete combustion of carbon-containing fuels.",
+                "health_effects": ["Headaches", "Dizziness", "Weakness", "Nausea", "Confusion", "At high levels: death"],
+                "main_sources": ["Vehicle exhaust", "Faulty heating systems", "Gas appliances", "Generators", "Charcoal grills"],
+                "safe_levels": "EPA standard: 9 ppm (8-hour average), 35 ppm (1-hour average)",
+                "protection": ["Install CO detectors", "Never use generators indoors", "Maintain heating systems", "Don't idle vehicles in garages"],
+                "emergency_signs": ["Severe headache", "Dizziness", "Confusion", "Nausea - seek immediate medical attention"]
+            }
+        }
+    
+    elif query_type == 'general_advice' or query_type == 'protection_advice':
         return {
             "type": "general_advice",
             "title": "Air Quality Protection Tips",
@@ -500,6 +1343,80 @@ def handle_general_questions(query_type, user_prompt):
             }
         }
     
+    elif query_type == 'general_air_quality':
+        # Use LLM to generate a relevant response for general air quality questions
+        try:
+            ai_prompt = f"""You are an expert air quality specialist with deep knowledge of air pollution, health effects, and environmental science. Answer this question comprehensively and accurately: "{user_prompt}"
+
+            Guidelines for your response:
+            1. Provide specific, actionable information with numbers/thresholds when relevant
+            2. Include health implications and who might be most at risk
+            3. Mention relevant AQI levels, pollutant concentrations, or safety standards
+            4. Offer practical advice for protection or improvement
+            5. Keep the tone professional but accessible
+            6. Structure your response clearly with bullet points or sections when appropriate
+            7. If the question is about "good" or "safe" levels, provide specific numerical ranges and AQI categories
+            
+            Focus on being helpful and informative about air quality topics including AQI, pollutants, health effects, protection strategies, and environmental conditions."""
+            
+            ai_response = llm.generate_content(ai_prompt)
+            
+            return {
+                "type": "ai_generated",
+                "title": "Air Quality Information",
+                "content": {
+                    "ai_response": ai_response.text,
+                    "note": "This response was generated using AI based on current air quality knowledge and research."
+                }
+            }
+        except Exception as e:
+            print(f"Error generating AI response: {e}")
+            return {
+                "type": "general_advice",
+                "title": "General Air Quality Information", 
+                "content": {
+                    "message": "I can help with air quality questions! Try asking about specific pollutants (ozone, PM2.5), health effects, protection strategies, or indoor air quality.",
+                    "examples": [
+                        "What is a good AQI range?",
+                        "How much ozone is too much?",
+                        "What are safe PM2.5 levels?",
+                        "When should I be concerned about air quality?",
+                        "What's the difference between PM2.5 and PM10?",
+                        "How can I improve my indoor air quality?"
+                    ]
+                }
+            }
+    
+    elif query_type == 'out_of_domain':
+        return {
+            "type": "out_of_domain",
+            "title": "Outside My Air Quality Expertise",
+            "content": {
+                "message": f"I'm sorry, but your question about '{user_prompt}' appears to be outside my area of expertise. I'm specifically designed to help with air quality and environmental health topics.",
+                "what_i_can_help_with": [
+                    "Air Quality Index (AQI) explanations and safe ranges",
+                    "Specific pollutants (PM2.5, ozone, NO₂, SO₂, CO)",
+                    "Health effects of air pollution on different groups",
+                    "Personal protection strategies and mask recommendations",
+                    "Indoor air quality improvement techniques",
+                    "Wildfire smoke safety and protection",
+                    "Allergy management during poor air quality",
+                    "Exercise and outdoor activity guidelines",
+                    "Air purifier recommendations and effectiveness",
+                    "Understanding air quality monitoring and data"
+                ],
+                "redirect": "I'd be happy to help you with any air quality, pollution, or environmental health questions instead!",
+                "examples": [
+                    "What is a good AQI range for outdoor activities?",
+                    "How much PM2.5 is considered safe?",
+                    "Should I wear a mask when AQI is over 100?",
+                    "How can I protect myself from wildfire smoke?",
+                    "What's the best air purifier for allergies?",
+                    "Is it safe to exercise when ozone levels are high?"
+                ]
+            }
+        }
+    
     return None
 
 @app.route('/api/query', methods=['POST'])
@@ -519,9 +1436,35 @@ def handle_query():
         query_type = classify_query_type(user_prompt)
         
         # Handle general questions that don't need location data
-        if query_type in ['aqi_explanation', 'health_advice', 'general_advice']:
+        if query_type in ['aqi_explanation', 'health_advice', 'general_advice', 'ozone_questions', 
+                         'particulate_questions', 'nitrogen_questions', 'sulfur_questions', 
+                         'carbon_monoxide_questions', 'allergy_pollen_advice', 'indoor_air_advice', 
+                         'wildfire_smoke_advice', 'protection_advice', 'exercise_advice', 
+                         'general_air_quality', 'out_of_domain']:
             general_response = handle_general_questions(query_type, user_prompt)
             if general_response:
+                # Add personalized recommendations for general health questions
+                user = get_user_from_token()
+                if user:
+                    user_id = user['user_id']
+                    user_profile = user_profiles.get(user_id)
+                    
+                    if user_profile and any([user_profile.get('age'), user_profile.get('medical_conditions'), 
+                                           user_profile.get('allergies'), user_profile.get('activity_level')]):
+                        # Generate personalized advice for general health questions
+                        personalized_advice = generate_personalized_health_advice(user_prompt, user_profile)
+                        general_response["personalized_recommendations"] = personalized_advice
+                    else:
+                        general_response["personalized_recommendations"] = {
+                            "message": "Create your health profile to receive personalized advice for your specific health conditions.",
+                            "call_to_action": "Click 'Health Profile' to get personalized recommendations!"
+                        }
+                else:
+                    general_response["personalized_recommendations"] = {
+                        "message": "Log in to receive health advice tailored to your personal medical conditions and lifestyle.",
+                        "call_to_action": "Click 'Login' to access personalized features!"
+                    }
+                
                 return jsonify({
                     "explanation": general_response,
                     "coordinates": None,
@@ -551,6 +1494,30 @@ def handle_query():
         
         # Add location name to the response
         explanation_json["location_name"] = location_name
+
+        # Always check for user authentication and add personalized recommendations
+        user = get_user_from_token()
+        if user:
+            user_id = user['user_id']
+            user_profile = user_profiles.get(user_id)
+            
+            # Generate personalized recommendations based on user profile
+            if user_profile and any([user_profile.get('age'), user_profile.get('medical_conditions'), 
+                                   user_profile.get('allergies'), user_profile.get('activity_level')]):
+                personalized_rec = generate_personalized_recommendations(aqi_data, user_profile)
+                explanation_json["personalized_recommendations"] = personalized_rec
+            else:
+                # User is authenticated but has no profile - encourage them to create one
+                explanation_json["personalized_recommendations"] = {
+                    "message": "Create your health profile to receive personalized air quality recommendations based on your age, medical conditions, and activity level.",
+                    "call_to_action": "Click 'Health Profile' to get started with personalized advice!"
+                }
+        else:
+            # User is not authenticated - encourage login for personalized features
+            explanation_json["personalized_recommendations"] = {
+                "message": "Log in to receive personalized air quality recommendations tailored to your health profile.",
+                "call_to_action": "Click 'Login' to access personalized health advice!"
+            }
 
         return jsonify({
             "coordinates": coordinates,
